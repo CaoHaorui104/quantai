@@ -117,6 +117,30 @@ h1, h2, h3 {
     white-space: pre-wrap;
 }
 
+/* Risk assessment cards */
+.risk-card {
+    background: #0f1629;
+    border-radius: 10px;
+    padding: 16px 18px;
+    text-align: center;
+    border: 1px solid #1e2d4a;
+}
+.risk-label { font-size: 11px; color: #64748b; margin-bottom: 6px; }
+.risk-value {
+    font-family: 'Space Mono', monospace;
+    font-size: 20px;
+    font-weight: 700;
+}
+.risk-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-top: 6px;
+}
+
 /* Fundamental data cards */
 .fund-card {
     background: #0f1629;
@@ -331,11 +355,14 @@ def run_backtest(
     holding_days: int = 5,
     stop_loss: float = 0.03,
     take_profit: float = 0.05,
+    slippage: float = 0.001,
+    commission: float = 0.001,
 ) -> dict:
     """
     Simulate the signal strategy on historical data.
     Entry on BUY (score >= 2) at next-day close.
     Exit priority: stop-loss → take-profit → sell signal → max holding days.
+    Slippage and commission are applied on both entry and exit legs.
     """
     scores = compute_signal_scores(df)
     closes = df["Close"].values
@@ -346,11 +373,14 @@ def run_backtest(
     in_trade = False
     entry_idx = entry_price = None
 
+    # Round-trip cost: buy slippage + sell slippage + 2 × commission
+    cost = 2 * slippage + 2 * commission
+
     for i in range(1, n - 1):
         if not in_trade:
             if scores.iloc[i] >= 2:
                 entry_idx = i + 1
-                entry_price = float(closes[entry_idx])
+                entry_price = float(closes[entry_idx]) * (1 + slippage + commission)
                 in_trade = True
         else:
             pnl = (float(closes[i]) - entry_price) / entry_price
@@ -370,17 +400,17 @@ def run_backtest(
             # SL/TP triggers on current bar close; signal exits on next-day close
             if reason.startswith("止"):
                 exit_idx = i
-                exit_price = float(closes[i])
+                exit_price = float(closes[i]) * (1 - slippage - commission)
             else:
                 exit_idx = min(i + 1, n - 1)
-                exit_price = float(closes[exit_idx])
+                exit_price = float(closes[exit_idx]) * (1 - slippage - commission)
 
             ret = (exit_price - entry_price) / entry_price
             trades.append({
                 "entry_date": dates[entry_idx],
                 "exit_date": dates[exit_idx],
-                "entry_price": round(entry_price, 2),
-                "exit_price": round(exit_price, 2),
+                "entry_price": round(float(closes[entry_idx]), 2),
+                "exit_price": round(float(closes[exit_idx]), 2),
                 "return": ret,
                 "days": exit_idx - entry_idx,
                 "exit_reason": reason,
@@ -389,13 +419,13 @@ def run_backtest(
 
     # Close any open position at end
     if in_trade and entry_idx is not None:
-        exit_price = float(closes[-1])
+        exit_price = float(closes[-1]) * (1 - slippage - commission)
         ret = (exit_price - entry_price) / entry_price
         trades.append({
             "entry_date": dates[entry_idx],
             "exit_date": dates[-1],
-            "entry_price": round(entry_price, 2),
-            "exit_price": round(exit_price, 2),
+            "entry_price": round(float(closes[entry_idx]), 2),
+            "exit_price": round(float(closes[-1]), 2),
             "return": ret,
             "days": n - 1 - entry_idx,
             "exit_reason": "期末清仓",
@@ -617,6 +647,85 @@ REASON: <15字以内的一句话理由>"""
     return {"score": score, "reason": reason}
 
 
+def generate_rule_report(
+    ticker: str,
+    df: pd.DataFrame,
+    signal: str,
+    info: dict,
+) -> str:
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    rsi = float(last["RSI"])
+    macd = float(last["MACD"])
+    macd_sig = float(last["MACD_Signal"])
+    close = float(last["Close"])
+    bb_upper = float(last["BB_Upper"])
+    bb_lower = float(last["BB_Lower"])
+    bb_mid = float(last["BB_Mid"])
+    price_20d_pct = (close - float(df["Close"].iloc[-20])) / float(df["Close"].iloc[-20]) * 100
+
+    parts = []
+
+    # ── Technical summary ────────────────────────────────────────────────────
+    if rsi < 35:
+        parts.append(f"RSI 处于 {rsi:.0f} 的超卖区间，短期存在技术性反弹预期")
+    elif rsi > 70:
+        parts.append(f"RSI 高达 {rsi:.0f}，市场情绪偏热，短线存在获利回吐压力")
+    else:
+        parts.append(f"RSI 为 {rsi:.0f}，动能中性")
+
+    macd_cross = ""
+    if macd > macd_sig and float(prev["MACD"]) <= float(prev["MACD_Signal"]):
+        macd_cross = "MACD 刚形成金叉，短期趋势转多"
+    elif macd < macd_sig and float(prev["MACD"]) >= float(prev["MACD_Signal"]):
+        macd_cross = "MACD 刚形成死叉，短期趋势转空"
+    elif macd > macd_sig:
+        macd_cross = "MACD 维持多头排列"
+    else:
+        macd_cross = "MACD 处于空头排列"
+    parts.append(macd_cross)
+
+    if close > bb_upper:
+        parts.append("价格突破布林带上轨，超买特征明显")
+    elif close < bb_lower:
+        parts.append("价格跌破布林带下轨，短期超卖")
+    else:
+        pct_in_band = (close - bb_lower) / (bb_upper - bb_lower) * 100 if (bb_upper - bb_lower) > 0 else 50
+        parts.append(f"价格位于布林带 {pct_in_band:.0f}% 位置，运行平稳")
+
+    # ── Fundamental color ────────────────────────────────────────────────────
+    pe = info.get("trailingPE")
+    beta = info.get("beta")
+    fund_notes = []
+    if pe and not np.isnan(float(pe)):
+        pe = float(pe)
+        if pe > 40:
+            fund_notes.append(f"市盈率 {pe:.0f}x 偏高，估值溢价明显")
+        elif pe < 15:
+            fund_notes.append(f"市盈率 {pe:.0f}x 处于低估区间")
+        else:
+            fund_notes.append(f"市盈率 {pe:.0f}x，估值合理")
+    if beta and not np.isnan(float(beta)):
+        beta = float(beta)
+        if beta > 1.5:
+            fund_notes.append(f"Beta {beta:.1f} 显示高弹性，波动显著大于大盘")
+        elif beta < 0.7:
+            fund_notes.append(f"Beta {beta:.1f} 低波动，防御属性较强")
+
+    if fund_notes:
+        parts.append("；".join(fund_notes))
+
+    # ── Signal conclusion ────────────────────────────────────────────────────
+    conclusion = {
+        "BUY":  f"综合来看，多项指标共振向上，近20日涨幅 {price_20d_pct:+.1f}%，技术面偏多，可关注逢低布局机会。",
+        "SELL": f"综合来看，多项指标发出预警，近20日涨幅 {price_20d_pct:+.1f}%，建议控制仓位，注意下行风险。",
+        "HOLD": f"综合来看，技术面信号中性，近20日涨幅 {price_20d_pct:+.1f}%，建议观望等待更明确方向。",
+    }[signal]
+
+    body = "；".join(parts) + "。" + conclusion
+    return f"⚠️ 以下为规则驱动分析，非 AI 生成，仅供参考。\n\n{body}"
+
+
 def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[str], api_key: str) -> str:
     last = df.iloc[-1]
     price_change = ((df["Close"].iloc[-1] - df["Close"].iloc[-20]) / df["Close"].iloc[-20] * 100)
@@ -649,6 +758,89 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
+
+
+@st.cache_data(ttl=300)
+def fetch_spy_6m() -> pd.Series:
+    try:
+        spy = yf.download("SPY", period="6mo", progress=False, auto_adjust=True)
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        return spy["Close"]
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def compute_risk_metrics(df: pd.DataFrame, spy_close: pd.Series, beta_from_info: float | None) -> dict:
+    daily = df["Close"].pct_change().dropna()
+    ann_vol = float(daily.std() * np.sqrt(252))
+
+    # Beta: prefer info value; recalculate from price data as fallback
+    if beta_from_info and not np.isnan(float(beta_from_info)):
+        beta = float(beta_from_info)
+        corr = None
+    else:
+        beta = None
+        corr = None
+
+    if not spy_close.empty:
+        spy_daily = spy_close.pct_change().dropna()
+        aligned = pd.concat([daily, spy_daily], axis=1, join="inner")
+        aligned.columns = ["stock", "spy"]
+        if len(aligned) >= 20:
+            corr = float(aligned.corr().iloc[0, 1])
+            if beta is None:
+                cov = aligned.cov().iloc[0, 1]
+                var_spy = float(aligned["spy"].var())
+                beta = float(cov / var_spy) if var_spy > 0 else None
+
+    return {"ann_vol": ann_vol, "beta": beta, "corr": corr}
+
+
+def build_comparison_chart(df: pd.DataFrame, spy_close: pd.Series, ticker: str) -> go.Figure:
+    # Trim stock to last 6 months
+    cutoff = df.index[-1] - pd.DateOffset(months=6)
+    stock_6m = df["Close"][df.index >= cutoff]
+
+    stock_norm = stock_6m / float(stock_6m.iloc[0])
+
+    fig = go.Figure()
+
+    if not spy_close.empty:
+        spy_aligned = spy_close.reindex(stock_6m.index, method="ffill").dropna()
+        spy_norm = spy_aligned / float(spy_aligned.iloc[0])
+        fig.add_trace(go.Scatter(
+            x=spy_norm.index, y=spy_norm.values, name="SPY",
+            line=dict(color="#64748b", width=1.5, dash="dot"),
+        ))
+
+    stock_color = "#6366f1"
+    fig.add_trace(go.Scatter(
+        x=stock_norm.index, y=stock_norm.values, name=ticker,
+        line=dict(color=stock_color, width=2.5),
+        fill="tozeroy", fillcolor="rgba(99,102,241,0.06)",
+    ))
+
+    final_ret = float(stock_norm.iloc[-1] - 1)
+    spy_ret = float(spy_norm.iloc[-1] - 1) if not spy_close.empty and len(spy_norm) else None
+    subtitle = f"{ticker} {final_ret:+.1%}"
+    if spy_ret is not None:
+        subtitle += f"  vs  SPY {spy_ret:+.1%}"
+
+    fig.update_layout(
+        height=260,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        xaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
+        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", title="净值 (起始=1)", tickformat=".2f"),
+        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+                    orientation="h", y=1.12, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+        title=dict(text=subtitle, font=dict(size=13, color="#94a3b8"), x=0, xanchor="left", pad=dict(b=4)),
+    )
+    fig.add_hline(y=1.0, line_dash="dash", line_color="#334155", opacity=0.6)
+    return fig
 
 
 def build_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
@@ -728,6 +920,8 @@ with st.sidebar:
     holding_days = st.slider("最长持仓天数", min_value=3, max_value=20, value=5, step=1)
     stop_loss_pct = st.slider("止损比例", min_value=1, max_value=10, value=3, step=1, format="%d%%")
     take_profit_pct = st.slider("止盈比例", min_value=1, max_value=20, value=5, step=1, format="%d%%")
+    slippage_pct = st.slider("滑点", min_value=0.0, max_value=1.0, value=0.1, step=0.05, format="%.2f%%")
+    commission_pct = st.slider("手续费（单边）", min_value=0.0, max_value=0.5, value=0.1, step=0.05, format="%.2f%%")
 
     run_btn = st.button("🚀 开始分析")
 
@@ -863,6 +1057,47 @@ for col, (label, val) in zip(fund_cols, fund_fields):
       {display}
     </div>""", unsafe_allow_html=True)
 
+# ── Risk Assessment ──────────────────────────────────────────────────────────
+spy_close = fetch_spy_6m()
+risk = compute_risk_metrics(df, spy_close, info.get("beta"))
+
+def _risk_level(vol, beta):
+    score = 0
+    if vol is not None:
+        score += 2 if vol > 0.40 else (1 if vol > 0.20 else 0)
+    if beta is not None:
+        score += 2 if abs(beta) > 1.5 else (1 if abs(beta) > 1.0 else 0)
+    if score >= 3:
+        return "高风险", "#f43f5e", "rgba(244,63,94,0.12)"
+    elif score >= 1:
+        return "中风险", "#f59e0b", "rgba(245,158,11,0.12)"
+    else:
+        return "低风险", "#10b981", "rgba(16,185,129,0.12)"
+
+rl_label, rl_color, rl_bg = _risk_level(risk["ann_vol"], risk["beta"])
+
+rc1, rc2, rc3, rc4 = st.columns(4)
+risk_cards = [
+    (rc1, "年化波动率", f"{risk['ann_vol']:.1%}" if risk["ann_vol"] is not None else "N/A",
+     ("高" if risk["ann_vol"] and risk["ann_vol"] > 0.40 else "中" if risk["ann_vol"] and risk["ann_vol"] > 0.20 else "低"),
+     ("#f43f5e" if risk["ann_vol"] and risk["ann_vol"] > 0.40 else "#f59e0b" if risk["ann_vol"] and risk["ann_vol"] > 0.20 else "#10b981")),
+    (rc2, "Beta 值", f"{risk['beta']:.2f}" if risk["beta"] is not None else "N/A",
+     ("高波动" if risk["beta"] and abs(risk["beta"]) > 1.5 else "中波动" if risk["beta"] and abs(risk["beta"]) > 1.0 else "低波动"),
+     ("#f43f5e" if risk["beta"] and abs(risk["beta"]) > 1.5 else "#f59e0b" if risk["beta"] and abs(risk["beta"]) > 1.0 else "#10b981")),
+    (rc3, "与SPY相关性", f"{risk['corr']:.2f}" if risk["corr"] is not None else "N/A",
+     ("强相关" if risk["corr"] and abs(risk["corr"]) > 0.7 else "中相关" if risk["corr"] and abs(risk["corr"]) > 0.4 else "弱相关"),
+     ("#94a3b8" if risk["corr"] and abs(risk["corr"]) > 0.7 else "#a78bfa" if risk["corr"] and abs(risk["corr"]) > 0.4 else "#34d399")),
+    (rc4, "综合风险等级", rl_label, "", rl_color),
+]
+for col, lbl, val, badge, color in risk_cards:
+    badge_html = f"<div class='risk-badge' style='background:{color}22;color:{color};'>{badge}</div>" if badge else ""
+    col.markdown(f"""
+    <div class='risk-card' style='border-color:{color}44;'>
+      <div class='risk-label'>{lbl}</div>
+      <div class='risk-value' style='color:{color};'>{val}</div>
+      {badge_html}
+    </div>""", unsafe_allow_html=True)
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Signal ────────────────────────────────────────────────────────────────────
@@ -896,13 +1131,22 @@ st.markdown("### 📊 技术图表")
 fig = build_chart(df, ticker)
 st.plotly_chart(fig, use_container_width=True)
 
+# ── Market Comparison ────────────────────────────────────────────────────────
+st.markdown("### 📈 大盘对比（近6个月收益率）")
+if spy_close.empty:
+    st.warning("⚠️ 无法加载 SPY 数据，大盘对比图暂不可用。")
+else:
+    cmp_fig = build_comparison_chart(df, spy_close, ticker)
+    st.plotly_chart(cmp_fig, use_container_width=True)
+
 # ── Backtest ─────────────────────────────────────────────────────────────────
 st.markdown(
     f"### 🔁 策略回测 "
     f"<span style='font-size:13px; color:#64748b; font-family:DM Sans,sans-serif; font-weight:400;'>"
     f"持仓 {holding_days}日 &nbsp;·&nbsp; "
     f"止损 <span style='color:#f43f5e;'>-{stop_loss_pct}%</span> &nbsp;·&nbsp; "
-    f"止盈 <span style='color:#10b981;'>+{take_profit_pct}%</span>"
+    f"止盈 <span style='color:#10b981;'>+{take_profit_pct}%</span> &nbsp;·&nbsp; "
+    f"滑点 {slippage_pct:.2f}% &nbsp;·&nbsp; 手续费 {commission_pct:.2f}%"
     f"</span>",
     unsafe_allow_html=True,
 )
@@ -913,6 +1157,8 @@ with st.spinner("回测计算中..."):
         holding_days=holding_days,
         stop_loss=stop_loss_pct / 100,
         take_profit=take_profit_pct / 100,
+        slippage=slippage_pct / 100,
+        commission=commission_pct / 100,
     )
 
 if bt["metrics"] is None:
@@ -1047,14 +1293,33 @@ st.markdown("---")
 st.markdown("### 🤖 AI 深度分析")
 
 if not api_key:
-    st.info("💡 在左侧输入 Anthropic API Key 即可获取 AI 智能分析报告。")
+    rule_report = generate_rule_report(ticker, df, signal, info)
+    st.markdown("""
+    <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
+      <span style='background:#1e2d4a;color:#94a3b8;font-size:11px;padding:3px 10px;
+                   border-radius:4px;font-family:Space Mono,monospace;'>规则驱动</span>
+      <span style='font-size:12px;color:#475569;'>输入 API Key 后切换为 Claude 深度分析</span>
+    </div>""", unsafe_allow_html=True)
+    st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
 else:
     with st.spinner("Claude 正在分析中..."):
         try:
             report = get_ai_analysis(ticker, df, signal, reasons, api_key)
+            st.markdown("""
+            <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
+              <span style='background:#1e1b4b;color:#a78bfa;font-size:11px;padding:3px 10px;
+                           border-radius:4px;font-family:Space Mono,monospace;'>Claude AI</span>
+            </div>""", unsafe_allow_html=True)
             st.markdown(f"<div class='ai-report'>{report}</div>", unsafe_allow_html=True)
         except Exception as e:
-            st.error(f"AI 分析失败：{e}")
+            st.error(f"Claude 分析失败：{e}")
+            rule_report = generate_rule_report(ticker, df, signal, info)
+            st.markdown("""
+            <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
+              <span style='background:#1e2d4a;color:#94a3b8;font-size:11px;padding:3px 10px;
+                           border-radius:4px;font-family:Space Mono,monospace;'>规则驱动（回退）</span>
+            </div>""", unsafe_allow_html=True)
+            st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
 
 # ── Raw data ──────────────────────────────────────────────────────────────────
 with st.expander("📋 查看原始数据"):
