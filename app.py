@@ -8,6 +8,11 @@ import anthropic
 from datetime import datetime, timedelta
 import time
 
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:
+    YFRateLimitError = Exception  # older yfinance versions don't export this
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="QuantAI · Stock Analyzer",
@@ -110,6 +115,32 @@ h1, h2, h3 {
     font-size: 15px;
     line-height: 1.7;
     white-space: pre-wrap;
+}
+
+/* Fundamental data cards */
+.fund-card {
+    background: #0f1629;
+    border: 1px solid #1e2d4a;
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-align: center;
+}
+.fund-label {
+    font-size: 11px;
+    color: #64748b;
+    margin-bottom: 6px;
+    letter-spacing: 0.3px;
+}
+.fund-value {
+    font-family: 'Space Mono', monospace;
+    font-size: 16px;
+    font-weight: 700;
+    color: #e2e8f0;
+}
+.fund-na {
+    font-family: 'Space Mono', monospace;
+    font-size: 16px;
+    color: #334155;
 }
 
 /* News items */
@@ -512,10 +543,10 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str]]:
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, period: str) -> pd.DataFrame:
+    # Let YFRateLimitError and network errors propagate to the caller for friendly UI handling
     df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
     if df.empty:
         return df
-    # Flatten MultiIndex columns if present
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df["MA20"] = df["Close"].rolling(20).mean()
@@ -738,14 +769,31 @@ if not run_btn:
     st.stop()
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
-with st.spinner(f"正在拉取 {ticker} 数据..."):
-    df = fetch_data(ticker, period)
-
-if df.empty:
-    st.error(f"❌ 找不到股票代码 **{ticker}**，请检查后重试。")
+try:
+    with st.spinner(f"正在拉取 {ticker} 数据..."):
+        df = fetch_data(ticker, period)
+except YFRateLimitError:
+    st.error("⏱️ Yahoo Finance 请求频率已达上限，请等待 1–2 分钟后重试。")
+    st.stop()
+except Exception as e:
+    st.error(f"❌ 数据拉取失败：{e}")
     st.stop()
 
-info = yf.Ticker(ticker).info
+if df.empty:
+    st.error(f"❌ 找不到股票代码 **{ticker}**，请检查拼写后重试。")
+    st.stop()
+
+try:
+    info = yf.Ticker(ticker).info
+    if not info:
+        raise ValueError("empty response")
+except YFRateLimitError:
+    info = {}
+    st.warning("⚠️ Yahoo Finance 频率限制，基本面数据暂时无法加载，稍后刷新可恢复。")
+except Exception:
+    info = {}
+    st.warning("⚠️ 无法获取基本面数据，相关字段将显示 N/A。")
+
 company_name = info.get("longName", ticker)
 
 # ── Header metrics ────────────────────────────────────────────────────────────
@@ -770,6 +818,50 @@ c2.metric("日涨跌", f"${change:+.2f}", "")
 c3.metric("成交量", f"{vol/1e6:.1f}M", "")
 c4.metric("52周高", f"${high52:.2f}", "")
 c5.metric("52周低", f"${low52:.2f}", "")
+
+# ── Fundamentals ─────────────────────────────────────────────────────────────
+def _fmt_num(val, prefix="", suffix="", decimals=2):
+    """Format large numbers into readable strings; return 'N/A' if missing."""
+    if val is None or (isinstance(val, float) and (val != val)):
+        return None
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        return None
+    if abs(val) >= 1e12:
+        return f"{prefix}{val/1e12:.{decimals}f}T{suffix}"
+    if abs(val) >= 1e9:
+        return f"{prefix}{val/1e9:.{decimals}f}B{suffix}"
+    if abs(val) >= 1e6:
+        return f"{prefix}{val/1e6:.{decimals}f}M{suffix}"
+    return f"{prefix}{val:.{decimals}f}{suffix}"
+
+def _fmt_plain(val, decimals=2, suffix=""):
+    if val is None or (isinstance(val, float) and (val != val)):
+        return None
+    try:
+        return f"{float(val):.{decimals}f}{suffix}"
+    except (TypeError, ValueError):
+        return None
+
+fund_fields = [
+    ("市盈率 P/E",    _fmt_plain(info.get("trailingPE"), decimals=1)),
+    ("市值",          _fmt_num(info.get("marketCap"), prefix="$")),
+    ("营收 TTM",      _fmt_num(info.get("totalRevenue"), prefix="$")),
+    ("净利润 TTM",    _fmt_num(info.get("netIncomeToCommon"), prefix="$")),
+    ("负债率 D/E",    _fmt_plain(info.get("debtToEquity"), decimals=2)),
+    ("Beta",          _fmt_plain(info.get("beta"), decimals=2)),
+    ("股息率",        _fmt_plain(info.get("dividendYield") and info["dividendYield"] * 100, decimals=2, suffix="%")),
+]
+
+fund_cols = st.columns(len(fund_fields))
+for col, (label, val) in zip(fund_cols, fund_fields):
+    display = f"<div class='fund-value'>{val}</div>" if val else "<div class='fund-na'>N/A</div>"
+    col.markdown(f"""
+    <div class='fund-card'>
+      <div class='fund-label'>{label}</div>
+      {display}
+    </div>""", unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
