@@ -794,6 +794,123 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
 
 
 @st.cache_data(ttl=600)
+def run_garch_forecast(returns_tuple: tuple, dates_tuple: tuple, n_forecast: int = 30) -> dict:
+    try:
+        from arch import arch_model
+    except ImportError:
+        return {"error": "arch_missing"}
+    try:
+        returns_scaled = np.array(returns_tuple) * 100  # scale for numerical stability
+        model = arch_model(returns_scaled, vol="Garch", p=1, q=1, dist="Normal", rescale=False)
+        fitted = model.fit(disp="off", show_warning=False)
+
+        # Historical conditional volatility (annualised %)
+        cond_vol_pct = pd.Series(fitted.conditional_volatility) / 100 * np.sqrt(252) * 100
+
+        # 20-day rolling realised volatility (annualised %)
+        raw = pd.Series(np.array(returns_tuple))
+        realized_pct = raw.rolling(20).std() * np.sqrt(252) * 100
+
+        # 30-day forecast
+        fc = fitted.forecast(horizon=n_forecast, reindex=False)
+        fc_var = fc.variance.iloc[-1].values          # shape (n_forecast,)
+        fc_vol_daily_pct = np.sqrt(fc_var) / 100 * 100   # daily vol %
+        fc_vol_annual_pct = fc_vol_daily_pct * np.sqrt(252)
+
+        avg_fc = float(fc_vol_annual_pct.mean())
+        if avg_fc < 15:
+            risk_level, risk_color = "低风险",   "#10b981"
+        elif avg_fc < 30:
+            risk_level, risk_color = "中等风险", "#f59e0b"
+        elif avg_fc < 50:
+            risk_level, risk_color = "高风险",   "#f97316"
+        else:
+            risk_level, risk_color = "极高风险", "#f43f5e"
+
+        p = fitted.params
+        alpha = float(p.get("alpha[1]", 0))
+        beta  = float(p.get("beta[1]",  0))
+
+        return {
+            "dates":          list(dates_tuple),
+            "cond_vol_pct":   cond_vol_pct.tolist(),
+            "realized_pct":   realized_pct.fillna(0).tolist(),
+            "fc_vol_annual":  fc_vol_annual_pct.tolist(),
+            "fc_vol_daily":   fc_vol_daily_pct.tolist(),
+            "current_vol":    float(cond_vol_pct.iloc[-1]),
+            "avg_fc_annual":  avg_fc,
+            "risk_level":     risk_level,
+            "risk_color":     risk_color,
+            "alpha":  alpha,
+            "beta":   beta,
+            "persistence": alpha + beta,
+            "error":  None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def build_garch_hist_chart(g: dict) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=g["dates"], y=g["realized_pct"],
+        name="已实现波动率（20日）",
+        line=dict(color="#64748b", width=1.5),
+        opacity=0.75,
+    ))
+    fig.add_trace(go.Scatter(
+        x=g["dates"], y=g["cond_vol_pct"],
+        name="GARCH 条件波动率",
+        line=dict(color="#a78bfa", width=2),
+        fill="tozeroy", fillcolor="rgba(167,139,250,0.07)",
+    ))
+    fig.update_layout(
+        height=260,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        xaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
+        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", title="年化波动率 (%)"),
+        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+                    orientation="h", y=1.12, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def build_garch_forecast_chart(g: dict) -> go.Figure:
+    days = list(range(1, len(g["fc_vol_annual"]) + 1))
+    color = g["risk_color"]
+    fig = go.Figure()
+    fig.add_hline(
+        y=g["current_vol"],
+        line_dash="dot", line_color="#475569", opacity=0.8,
+        annotation_text=f"当前 {g['current_vol']:.1f}%",
+        annotation_font_color="#64748b", annotation_font_size=10,
+    )
+    fig.add_trace(go.Scatter(
+        x=days, y=g["fc_vol_annual"],
+        name="预测年化波动率",
+        line=dict(color=color, width=2.5),
+        fill="tozeroy", fillcolor=f"rgba(99,102,241,0.07)",
+        mode="lines+markers",
+        marker=dict(size=4, color=color),
+        hovertemplate="第 %{x} 天: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        height=260,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        xaxis=dict(title="未来天数", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", dtick=5),
+        yaxis=dict(title="年化波动率 (%)", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
+        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+    )
+    return fig
+
+
+@st.cache_data(ttl=600)
 def run_monte_carlo(
     last_close: float,
     daily_mu: float,
@@ -1567,53 +1684,110 @@ else:
 
 st.markdown("---")
 
-# ── Monte Carlo ───────────────────────────────────────────────────────────────
-st.markdown("### 🎲 蒙特卡洛价格路径模拟（未来30天 · 1000条路径）")
-
+# ── Monte Carlo & GARCH (tabs) ────────────────────────────────────────────────
 _daily_ret = df["Close"].pct_change().dropna()
 _mu  = round(float(_daily_ret.mean()), 8)
 _sig = round(float(_daily_ret.std()),  8)
 
-with st.spinner("正在运行 1000 条路径模拟..."):
-    mc = run_monte_carlo(last_close, _mu, _sig)
+mc_tab, garch_tab = st.tabs(["🎲 蒙特卡洛模拟（30天·1000条路径）", "📊 GARCH 波动率预测"])
 
-# Key metric cards
-p5_price  = mc["pcts"][5][-1]
-p50_price = mc["pcts"][50][-1]
-p95_price = mc["pcts"][95][-1]
-up_prob   = mc["up_prob"]
+with mc_tab:
+    with st.spinner("正在运行 1000 条路径模拟..."):
+        mc = run_monte_carlo(last_close, _mu, _sig)
 
-def _mc_color(price):
-    return "#10b981" if price >= last_close else "#f43f5e"
+    p5_price  = mc["pcts"][5][-1]
+    p50_price = mc["pcts"][50][-1]
+    p95_price = mc["pcts"][95][-1]
+    up_prob   = mc["up_prob"]
 
-mc1, mc2, mc3, mc4 = st.columns(4)
-mc_cards = [
-    (mc1, "悲观预期（5th）",  f"${p5_price:.2f}",  f"{(p5_price-last_close)/last_close:+.1%}",  _mc_color(p5_price)),
-    (mc2, "中位数（50th）",   f"${p50_price:.2f}", f"{(p50_price-last_close)/last_close:+.1%}", _mc_color(p50_price)),
-    (mc3, "乐观预期（95th）", f"${p95_price:.2f}", f"{(p95_price-last_close)/last_close:+.1%}", _mc_color(p95_price)),
-    (mc4, "30日上涨概率",    f"{up_prob:.1%}",     f"基于 {mc['n_sims']} 次模拟",
-     "#10b981" if up_prob >= 0.5 else "#f43f5e"),
-]
-for col, lbl, val, sub, color in mc_cards:
-    col.markdown(f"""
-    <div class='mc-card'>
-      <div class='mc-label'>{lbl}</div>
-      <div class='mc-value' style='color:{color};'>{val}</div>
-      <div class='mc-sub'>{sub}</div>
-    </div>""", unsafe_allow_html=True)
+    def _mc_color(price):
+        return "#10b981" if price >= last_close else "#f43f5e"
 
-st.markdown("<br>", unsafe_allow_html=True)
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc_cards = [
+        (mc1, "悲观预期（5th）",  f"${p5_price:.2f}",  f"{(p5_price-last_close)/last_close:+.1%}",  _mc_color(p5_price)),
+        (mc2, "中位数（50th）",   f"${p50_price:.2f}", f"{(p50_price-last_close)/last_close:+.1%}", _mc_color(p50_price)),
+        (mc3, "乐观预期（95th）", f"${p95_price:.2f}", f"{(p95_price-last_close)/last_close:+.1%}", _mc_color(p95_price)),
+        (mc4, "30日上涨概率",    f"{up_prob:.1%}",     f"基于 {mc['n_sims']} 次模拟",
+         "#10b981" if up_prob >= 0.5 else "#f43f5e"),
+    ]
+    for col, lbl, val, sub, color in mc_cards:
+        col.markdown(f"""
+        <div class='mc-card'>
+          <div class='mc-label'>{lbl}</div>
+          <div class='mc-value' style='color:{color};'>{val}</div>
+          <div class='mc-sub'>{sub}</div>
+        </div>""", unsafe_allow_html=True)
 
-# Chart + distribution side by side
-ch_col, dist_col = st.columns([3, 2])
-with ch_col:
-    st.plotly_chart(build_mc_chart(mc, ticker), width="stretch")
-with dist_col:
-    st.markdown(
-        "<div style='font-size:12px;color:#64748b;margin-bottom:8px;'>30日后收益区间概率分布</div>",
-        unsafe_allow_html=True,
-    )
-    st.plotly_chart(build_mc_dist_chart(mc), width="stretch")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    ch_col, dist_col = st.columns([3, 2])
+    with ch_col:
+        st.plotly_chart(build_mc_chart(mc, ticker), width="stretch")
+    with dist_col:
+        st.markdown(
+            "<div style='font-size:12px;color:#64748b;margin-bottom:8px;'>30日后收益区间概率分布</div>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(build_mc_dist_chart(mc), width="stretch")
+
+with garch_tab:
+    with st.spinner("正在拟合 GARCH(1,1) 模型..."):
+        _ret_tuple   = tuple(_daily_ret.values.round(8))
+        _dates_tuple = tuple(_daily_ret.index.strftime("%Y-%m-%d"))
+        g = run_garch_forecast(_ret_tuple, _dates_tuple)
+
+    if g.get("error") == "arch_missing":
+        st.error("❌ 请安装 arch 库：`pip install arch`")
+    elif g.get("error"):
+        st.error(f"❌ GARCH 拟合失败：{g['error']}")
+    else:
+        # ── Metric cards ──────────────────────────────────────────────────
+        g1, g2, g3, g4 = st.columns(4)
+        _risk_c = g["risk_color"]
+        _g_cards = [
+            (g1, "当前条件波动率",    f"{g['current_vol']:.1f}%",     "GARCH 最新估计（年化）", "#a78bfa"),
+            (g2, "30日预测均值",      f"{g['avg_fc_annual']:.1f}%",   "预测年化波动率均值",     _risk_c),
+            (g3, "波动率风险评级",    g["risk_level"],                 "",                       _risk_c),
+            (g4, "持续性 α+β",        f"{g['persistence']:.4f}",      "越接近1波动率衰减越慢",  "#f59e0b"),
+        ]
+        for col, lbl, val, sub, color in _g_cards:
+            col.markdown(f"""
+            <div class='mc-card'>
+              <div class='mc-label'>{lbl}</div>
+              <div class='mc-value' style='color:{color};'>{val}</div>
+              <div class='mc-sub'>{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Charts side by side ───────────────────────────────────────────
+        hist_col, fc_col = st.columns(2)
+        with hist_col:
+            st.markdown(
+                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                "历史波动率 vs GARCH 条件波动率</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(build_garch_hist_chart(g), width="stretch")
+        with fc_col:
+            st.markdown(
+                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                "未来 30 天年化波动率预测</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(build_garch_forecast_chart(g), width="stretch")
+
+        # ── Model params ──────────────────────────────────────────────────
+        st.markdown(
+            f"<div style='font-size:11px;color:#475569;margin-top:4px;'>"
+            f"GARCH(1,1) 参数 &nbsp;·&nbsp; "
+            f"α (ARCH) = {g['alpha']:.5f} &nbsp;·&nbsp; "
+            f"β (GARCH) = {g['beta']:.5f} &nbsp;·&nbsp; "
+            f"持续性 α+β = {g['persistence']:.5f}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
 st.markdown("---")
 
