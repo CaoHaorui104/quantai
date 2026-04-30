@@ -21,43 +21,50 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
+# ── Theme ─────────────────────────────────────────────────────────────────────
+dark_mode = st.sidebar.toggle("Dark Mode", value=True, key="dark_mode")
+
+_DARK = dict(
+    bg="#0a0e1a", surface="#0f1629", border="#1e2d4a",
+    text="#e2e8f0", muted="#64748b", dim="#475569",
+    up="#10b981", down="#f43f5e", accent="#6366f1",
+    accent2="#a78bfa", warn="#f59e0b", blue="#3b82f6",
+)
+_LIGHT = dict(
+    bg="#f8fafc", surface="#ffffff", border="#e2e8f0",
+    text="#0f172a", muted="#64748b", dim="#94a3b8",
+    up="#059669", down="#dc2626", accent="#4f46e5",
+    accent2="#7c3aed", warn="#d97706", blue="#2563eb",
+)
+C = _DARK if dark_mode else _LIGHT
+
+
+def _get_css(C: dict) -> str:
+    return f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
 
-html, body, [class*="css"] {
+html, body, [class*="css"] {{
     font-family: 'DM Sans', sans-serif;
-    background-color: #0a0e1a;
-    color: #e2e8f0;
-}
+    background-color: {C["bg"]};
+    color: {C["text"]};
+}}
+.main {{ background-color: {C["bg"]}; }}
+h1, h2, h3 {{ font-family: 'Space Mono', monospace; letter-spacing: -0.5px; }}
+.stApp {{ background: {C["bg"]}; }}
 
-.main { background-color: #0a0e1a; }
-
-h1, h2, h3 {
-    font-family: 'Space Mono', monospace;
-    letter-spacing: -0.5px;
-}
-
-.stApp { background: #0a0e1a; }
-
-/* Sidebar */
-[data-testid="stSidebar"] {
-    background: #0f1629 !important;
-    border-right: 1px solid #1e2d4a;
-}
-
-/* Metric cards */
-[data-testid="metric-container"] {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
+[data-testid="stSidebar"] {{
+    background: {C["surface"]} !important;
+    border-right: 1px solid {C["border"]};
+}}
+[data-testid="metric-container"] {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
     border-radius: 12px;
     padding: 16px;
-}
-
-/* Buttons */
-.stButton > button {
-    background: linear-gradient(135deg, #3b82f6, #6366f1);
+}}
+.stButton > button {{
+    background: {C["accent"]};
     color: white;
     border: none;
     border-radius: 8px;
@@ -66,100 +73,85 @@ h1, h2, h3 {
     padding: 10px 24px;
     width: 100%;
     transition: opacity 0.2s;
-}
-.stButton > button:hover { opacity: 0.85; }
-
-/* Input */
+}}
+.stButton > button:hover {{ opacity: 0.85; }}
 .stTextInput > div > div > input,
-.stSelectbox > div > div > select {
-    background: #0f1629 !important;
-    border: 1px solid #1e2d4a !important;
-    color: #e2e8f0 !important;
+.stSelectbox > div > div > select {{
+    background: {C["surface"]} !important;
+    border: 1px solid {C["border"]} !important;
+    color: {C["text"]} !important;
     border-radius: 8px !important;
     font-family: 'DM Sans', sans-serif;
-}
+}}
 
-/* Signal box */
-.signal-buy {
-    background: linear-gradient(135deg, #064e3b, #065f46);
-    border: 1px solid #10b981;
+.signal-buy {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-left: 3px solid {C["up"]};
     border-radius: 12px;
     padding: 20px 24px;
     text-align: center;
     font-family: 'Space Mono', monospace;
-}
-.signal-sell {
-    background: linear-gradient(135deg, #4c0519, #881337);
-    border: 1px solid #f43f5e;
+}}
+.signal-sell {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-left: 3px solid {C["down"]};
     border-radius: 12px;
     padding: 20px 24px;
     text-align: center;
     font-family: 'Space Mono', monospace;
-}
-.signal-hold {
-    background: linear-gradient(135deg, #1c1917, #292524);
-    border: 1px solid #a8a29e;
+}}
+.signal-hold {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
     border-radius: 12px;
     padding: 20px 24px;
     text-align: center;
     font-family: 'Space Mono', monospace;
-}
+}}
 
-/* AI report */
-.ai-report {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
-    border-left: 3px solid #6366f1;
+.ai-report {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-left: 3px solid {C["accent2"]};
     border-radius: 12px;
     padding: 24px;
     font-size: 15px;
     line-height: 1.7;
     white-space: pre-wrap;
-}
-
-/* Portfolio weight ticker cards */
-.po-ticker-card {
-    background: #0f1629;
-    border-radius: 10px;
+}}
+.po-ticker-card {{
+    background: {C["surface"]};
+    border-radius: 12px;
     padding: 14px 16px;
     text-align: center;
-    border-top: 3px solid #6366f1;
-    border-left: 1px solid #1e2d4a;
-    border-right: 1px solid #1e2d4a;
-    border-bottom: 1px solid #1e2d4a;
-}
-
-/* Monte Carlo key metric cards */
-.mc-card {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
-    border-radius: 10px;
+    border-top: 3px solid {C["accent"]};
+    border-left: 1px solid {C["border"]};
+    border-right: 1px solid {C["border"]};
+    border-bottom: 1px solid {C["border"]};
+}}
+.mc-card {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-radius: 12px;
     padding: 14px 16px;
     text-align: center;
-}
-.mc-label { font-size: 11px; color: #64748b; margin-bottom: 6px; }
-.mc-value {
-    font-family: 'Space Mono', monospace;
-    font-size: 18px;
-    font-weight: 700;
-}
-.mc-sub { font-size: 10px; color: #475569; margin-top: 4px; }
+}}
+.mc-label {{ font-size: 11px; color: {C["muted"]}; margin-bottom: 6px; }}
+.mc-value {{ font-family: 'Space Mono', monospace; font-size: 18px; font-weight: 700; }}
+.mc-sub {{ font-size: 10px; color: {C["dim"]}; margin-top: 4px; }}
 
-/* Risk assessment cards */
-.risk-card {
-    background: #0f1629;
-    border-radius: 10px;
+.risk-card {{
+    background: {C["surface"]};
+    border-radius: 12px;
     padding: 16px 18px;
     text-align: center;
-    border: 1px solid #1e2d4a;
-}
-.risk-label { font-size: 11px; color: #64748b; margin-bottom: 6px; }
-.risk-value {
-    font-family: 'Space Mono', monospace;
-    font-size: 20px;
-    font-weight: 700;
-}
-.risk-badge {
+    border: 1px solid {C["border"]};
+}}
+.risk-label {{ font-size: 11px; color: {C["muted"]}; margin-bottom: 6px; }}
+.risk-value {{ font-family: 'Space Mono', monospace; font-size: 20px; font-weight: 700; }}
+.risk-badge {{
     display: inline-block;
     font-size: 10px;
     font-weight: 600;
@@ -167,159 +159,93 @@ h1, h2, h3 {
     padding: 2px 8px;
     border-radius: 4px;
     margin-top: 6px;
-}
+}}
 
-/* Fundamental data cards */
-.fund-card {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
-    border-radius: 10px;
+.fund-card {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-radius: 12px;
     padding: 14px 16px;
     text-align: center;
-}
-.fund-label {
-    font-size: 11px;
-    color: #64748b;
-    margin-bottom: 6px;
-    letter-spacing: 0.3px;
-}
-.fund-value {
-    font-family: 'Space Mono', monospace;
-    font-size: 16px;
-    font-weight: 700;
-    color: #e2e8f0;
-}
-.fund-na {
-    font-family: 'Space Mono', monospace;
-    font-size: 16px;
-    color: #334155;
-}
+}}
+.fund-label {{ font-size: 11px; color: {C["muted"]}; margin-bottom: 6px; letter-spacing: 0.3px; }}
+.fund-value {{ font-family: 'Space Mono', monospace; font-size: 16px; font-weight: 700; color: {C["text"]}; }}
+.fund-na {{ font-family: 'Space Mono', monospace; font-size: 16px; color: {C["dim"]}; }}
 
-/* News items */
-.news-item {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
-    border-radius: 10px;
+.news-item {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-radius: 12px;
     padding: 12px 16px;
     margin-bottom: 8px;
     display: flex;
     align-items: flex-start;
     gap: 12px;
     transition: border-color 0.2s;
-}
-.news-item:hover { border-color: #3b82f6; }
-.news-item a {
-    color: #e2e8f0;
-    text-decoration: none;
-    font-size: 14px;
-    line-height: 1.5;
-    flex: 1;
-}
-.news-item a:hover { color: #93c5fd; }
-.news-meta {
-    font-size: 11px;
-    color: #475569;
-    margin-top: 4px;
-    white-space: nowrap;
-}
-.news-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #334155;
-    margin-top: 6px;
-    flex-shrink: 0;
-}
+}}
+.news-item:hover {{ border-color: {C["blue"]}; }}
+.news-item a {{ color: {C["text"]}; text-decoration: none; font-size: 14px; line-height: 1.5; flex: 1; }}
+.news-item a:hover {{ color: {C["blue"]}; }}
+.news-meta {{ font-size: 11px; color: {C["dim"]}; margin-top: 4px; white-space: nowrap; }}
+.news-dot {{
+    width: 8px; height: 8px; border-radius: 50%;
+    background: {C["border"]}; margin-top: 6px; flex-shrink: 0;
+}}
 
-/* Sentiment gauge */
-.sentiment-wrap {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
+.sentiment-wrap {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
     border-radius: 12px;
     padding: 20px 24px;
     display: flex;
     align-items: center;
     gap: 24px;
     margin-bottom: 16px;
-}
-.sentiment-score-box {
-    text-align: center;
-    min-width: 90px;
-}
-.sentiment-score-num {
-    font-family: 'Space Mono', monospace;
-    font-size: 36px;
-    font-weight: 700;
-    line-height: 1;
-}
-.sentiment-score-label {
-    font-size: 10px;
-    color: #64748b;
-    margin-top: 4px;
-    letter-spacing: 0.5px;
-}
-.sentiment-right { flex: 1; }
-.sentiment-bar-track {
-    background: #1e2d4a;
-    border-radius: 4px;
-    height: 8px;
-    width: 100%;
-    position: relative;
-    margin-bottom: 6px;
-    overflow: hidden;
-}
-.sentiment-reason {
-    font-size: 13px;
-    color: #94a3b8;
-    margin-top: 8px;
-}
+}}
+.sentiment-score-box {{ text-align: center; min-width: 90px; }}
+.sentiment-score-num {{ font-family: 'Space Mono', monospace; font-size: 36px; font-weight: 700; line-height: 1; }}
+.sentiment-score-label {{ font-size: 10px; color: {C["muted"]}; margin-top: 4px; letter-spacing: 0.5px; }}
+.sentiment-right {{ flex: 1; }}
+.sentiment-bar-track {{
+    background: {C["border"]};
+    border-radius: 4px; height: 8px; width: 100%;
+    position: relative; margin-bottom: 6px; overflow: hidden;
+}}
+.sentiment-reason {{ font-size: 13px; color: {C["muted"]}; margin-top: 8px; }}
 
-/* Backtest metric card */
-.bt-card {
-    background: #0f1629;
-    border: 1px solid #1e2d4a;
+.bt-card {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
     border-radius: 12px;
     padding: 18px 20px;
     text-align: center;
-}
-.bt-card .bt-label {
-    font-size: 11px;
-    color: #64748b;
-    font-family: 'DM Sans', sans-serif;
-    margin-bottom: 6px;
-}
-.bt-card .bt-value {
-    font-family: 'Space Mono', monospace;
-    font-size: 22px;
-    font-weight: 700;
-}
-.bt-card .bt-sub {
-    font-size: 11px;
-    color: #64748b;
-    margin-top: 4px;
-}
+}}
+.bt-card .bt-label {{ font-size: 11px; color: {C["muted"]}; font-family: 'DM Sans', sans-serif; margin-bottom: 6px; }}
+.bt-card .bt-value {{ font-family: 'Space Mono', monospace; font-size: 22px; font-weight: 700; }}
+.bt-card .bt-sub {{ font-size: 11px; color: {C["muted"]}; margin-top: 4px; }}
 
-/* Header banner */
-.header-banner {
-    background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
-    border: 1px solid #312e81;
-    border-radius: 16px;
-    padding: 28px 36px;
-    margin-bottom: 28px;
-}
-.ticker-tag {
+.header-banner {{
+    background: {C["surface"]};
+    border: 1px solid {C["border"]};
+    border-radius: 12px;
+    padding: 24px 32px;
+    margin-bottom: 24px;
+}}
+.ticker-tag {{
     display: inline-block;
-    background: #1e2d4a;
-    border: 1px solid #3b82f6;
-    border-radius: 6px;
+    background: {C["bg"]};
+    border: 1px solid {C["border"]};
+    border-radius: 4px;
     padding: 3px 10px;
     font-family: 'Space Mono', monospace;
     font-size: 12px;
-    color: #93c5fd;
+    color: {C["muted"]};
     margin-right: 8px;
-}
+}}
 </style>
-""", unsafe_allow_html=True)
+"""
+
+st.markdown(_get_css(C), unsafe_allow_html=True)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -500,23 +426,22 @@ def run_backtest(
     return {"trades": trades_df, "metrics": metrics, "equity": equity_series}
 
 
-def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.DataFrame) -> go.Figure:
+def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.DataFrame, C: dict) -> go.Figure:
     bh = df["Close"] / float(df["Close"].iloc[0])
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=bh.index, y=bh.values, name="买入持有",
-        line=dict(color="#475569", width=1.5, dash="dot"),
+        line=dict(color=C["dim"], width=1.5, dash="dot"),
     ))
     fig.add_trace(go.Scatter(
         x=equity.index, y=equity.values, name="策略净值",
-        line=dict(color="#6366f1", width=2.5),
+        line=dict(color=C["accent"], width=2.5),
         fill="tozeroy", fillcolor="rgba(99,102,241,0.07)",
         mode="lines+markers",
-        marker=dict(size=5, color="#a78bfa"),
+        marker=dict(size=5, color=C["accent2"]),
     ))
 
-    # Mark winning / losing trades on the equity curve
     if not trades_df.empty:
         wins = trades_df[trades_df["return"] > 0]
         losses = trades_df[trades_df["return"] <= 0]
@@ -525,21 +450,21 @@ def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.Data
         if not win_equity.empty:
             fig.add_trace(go.Scatter(
                 x=wins["exit_date"], y=win_equity.values, mode="markers", name="盈利交易",
-                marker=dict(color="#10b981", size=9, symbol="triangle-up"),
+                marker=dict(color=C["up"], size=9, symbol="triangle-up"),
             ))
         if not loss_equity.empty:
             fig.add_trace(go.Scatter(
                 x=losses["exit_date"], y=loss_equity.values, mode="markers", name="亏损交易",
-                marker=dict(color="#f43f5e", size=9, symbol="triangle-down"),
+                marker=dict(color=C["down"], size=9, symbol="triangle-down"),
             ))
 
     fig.update_layout(
         height=320,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
-        xaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
-        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", title="净值 (起始=1)"),
-        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"], title="净值 (起始=1)"),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
                     orientation="h", y=1.08, font=dict(size=11)),
         margin=dict(l=0, r=0, t=30, b=0),
         hovermode="x unified",
@@ -924,27 +849,27 @@ def run_garch_forecast(returns_tuple: tuple, dates_tuple: tuple, n_forecast: int
         return {"error": str(e)}
 
 
-def build_garch_hist_chart(g: dict) -> go.Figure:
+def build_garch_hist_chart(g: dict, C: dict) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=g["dates"], y=g["realized_pct"],
         name="已实现波动率（20日）",
-        line=dict(color="#64748b", width=1.5),
+        line=dict(color=C["muted"], width=1.5),
         opacity=0.75,
     ))
     fig.add_trace(go.Scatter(
         x=g["dates"], y=g["cond_vol_pct"],
         name="GARCH 条件波动率",
-        line=dict(color="#a78bfa", width=2),
+        line=dict(color=C["accent2"], width=2),
         fill="tozeroy", fillcolor="rgba(167,139,250,0.07)",
     ))
     fig.update_layout(
         height=260,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
-        xaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
-        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", title="年化波动率 (%)"),
-        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"], title="年化波动率 (%)"),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
                     orientation="h", y=1.12, font=dict(size=11)),
         margin=dict(l=0, r=0, t=10, b=0),
         hovermode="x unified",
@@ -952,32 +877,32 @@ def build_garch_hist_chart(g: dict) -> go.Figure:
     return fig
 
 
-def build_garch_forecast_chart(g: dict) -> go.Figure:
+def build_garch_forecast_chart(g: dict, C: dict) -> go.Figure:
     days = list(range(1, len(g["fc_vol_annual"]) + 1))
     color = g["risk_color"]
     fig = go.Figure()
     fig.add_hline(
         y=g["current_vol"],
-        line_dash="dot", line_color="#475569", opacity=0.8,
+        line_dash="dot", line_color=C["dim"], opacity=0.8,
         annotation_text=f"当前 {g['current_vol']:.1f}%",
-        annotation_font_color="#64748b", annotation_font_size=10,
+        annotation_font_color=C["muted"], annotation_font_size=10,
     )
     fig.add_trace(go.Scatter(
         x=days, y=g["fc_vol_annual"],
         name="预测年化波动率",
         line=dict(color=color, width=2.5),
-        fill="tozeroy", fillcolor=f"rgba(99,102,241,0.07)",
+        fill="tozeroy", fillcolor="rgba(99,102,241,0.07)",
         mode="lines+markers",
         marker=dict(size=4, color=color),
         hovertemplate="第 %{x} 天: %{y:.1f}%<extra></extra>",
     ))
     fig.update_layout(
         height=260,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
-        xaxis=dict(title="未来天数", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", dtick=5),
-        yaxis=dict(title="年化波动率 (%)", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
-        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1, font=dict(size=11)),
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(title="未来天数", gridcolor=C["border"], zerolinecolor=C["border"], dtick=5),
+        yaxis=dict(title="年化波动率 (%)", gridcolor=C["border"], zerolinecolor=C["border"]),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1, font=dict(size=11)),
         margin=dict(l=0, r=0, t=10, b=0),
         hovermode="x unified",
     )
@@ -1026,13 +951,12 @@ def run_monte_carlo(
     }
 
 
-def build_mc_chart(mc: dict, ticker: str) -> go.Figure:
+def build_mc_chart(mc: dict, ticker: str, C: dict) -> go.Figure:
     days = np.arange(mc["n_days"] + 1)
     S0, pcts = mc["S0"], mc["pcts"]
 
     fig = go.Figure()
 
-    # Background paths sample (200)
     sample = mc["paths"][:, :200]
     for col in range(sample.shape[1]):
         fig.add_trace(go.Scatter(
@@ -1041,7 +965,6 @@ def build_mc_chart(mc: dict, ticker: str) -> go.Figure:
             showlegend=False, hoverinfo="skip",
         ))
 
-    # Shaded bands
     def _band(hi, lo, fill_color, name):
         fig.add_trace(go.Scatter(
             x=np.concatenate([days, days[::-1]]),
@@ -1054,11 +977,10 @@ def build_mc_chart(mc: dict, ticker: str) -> go.Figure:
     _band(95, 5,  "rgba(99,102,241,0.07)",  "5–95% 区间")
     _band(75, 25, "rgba(99,102,241,0.13)",  "25–75% 区间")
 
-    # Three key percentile lines
     for p, color, dash, name in [
-        (5,  "#f43f5e", "dash",  "5th pct（悲观）"),
-        (50, "#a78bfa", "solid", "中位数"),
-        (95, "#10b981", "dash",  "95th pct（乐观）"),
+        (5,  C["down"],   "dash",  "5th pct（悲观）"),
+        (50, C["accent2"], "solid", "中位数"),
+        (95, C["up"],     "dash",  "95th pct（乐观）"),
     ]:
         fig.add_trace(go.Scatter(
             x=days, y=pcts[p], name=name,
@@ -1066,18 +988,18 @@ def build_mc_chart(mc: dict, ticker: str) -> go.Figure:
         ))
 
     fig.add_hline(
-        y=S0, line_dash="dot", line_color="#475569", opacity=0.8,
+        y=S0, line_dash="dot", line_color=C["dim"], opacity=0.8,
         annotation_text=f"当前 ${S0:.2f}",
-        annotation_font_color="#64748b", annotation_font_size=11,
+        annotation_font_color=C["muted"], annotation_font_size=11,
     )
 
     fig.update_layout(
         height=340,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
-        xaxis=dict(title="未来天数", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", dtick=5),
-        yaxis=dict(title="模拟价格 ($)", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
-        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(title="未来天数", gridcolor=C["border"], zerolinecolor=C["border"], dtick=5),
+        yaxis=dict(title="模拟价格 ($)", gridcolor=C["border"], zerolinecolor=C["border"]),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
                     orientation="h", y=1.12, font=dict(size=11)),
         margin=dict(l=0, r=0, t=10, b=0),
         hovermode="x unified",
@@ -1085,29 +1007,29 @@ def build_mc_chart(mc: dict, ticker: str) -> go.Figure:
     return fig
 
 
-def build_mc_dist_chart(mc: dict) -> go.Figure:
+def build_mc_dist_chart(mc: dict, C: dict) -> go.Figure:
     labels = [p[0] for p in mc["probs"]]
     values = [p[1] * 100 for p in mc["probs"]]
-    colors = ["#f43f5e", "#f97316", "#64748b", "#34d399", "#10b981"]
+    colors = [C["down"], "#f97316", C["muted"], "#34d399", C["up"]]
 
     fig = go.Figure(go.Bar(
         x=values, y=labels, orientation="h",
         marker_color=colors,
         text=[f"{v:.1f}%" for v in values],
         textposition="outside",
-        textfont=dict(family="Space Mono, monospace", size=12, color="#e2e8f0"),
+        textfont=dict(family="Space Mono, monospace", size=12, color=C["text"]),
         hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
     ))
 
     fig.update_layout(
         height=240,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
         xaxis=dict(
-            title="概率 (%)", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a",
+            title="概率 (%)", gridcolor=C["border"], zerolinecolor=C["border"],
             range=[0, max(values) * 1.35],
         ),
-        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
         margin=dict(l=0, r=50, t=0, b=0),
         showlegend=False,
     )
@@ -1196,22 +1118,21 @@ def fetch_and_optimize(tickers: tuple) -> dict:
         return {"error": str(e)}
 
 
-def build_ef_chart(result: dict) -> go.Figure:
+def build_ef_chart(result: dict, C: dict) -> go.Figure:
     fig = go.Figure()
 
-    # Random portfolio scatter (coloured by Sharpe)
     fig.add_trace(go.Scatter(
         x=result["rand_vols"], y=result["rand_rets"],
         mode="markers",
         marker=dict(
             size=3, opacity=0.45,
             color=result["rand_sharpes"],
-            colorscale=[[0, "#0f1629"], [0.45, "#3b4fd4"], [1, "#10b981"]],
+            colorscale=[[0, C["surface"]], [0.45, "#3b4fd4"], [1, C["up"]]],
             showscale=True,
             colorbar=dict(
-                title=dict(text="Sharpe", font=dict(size=11, color="#64748b")),
+                title=dict(text="Sharpe", font=dict(size=11, color=C["muted"])),
                 thickness=10, len=0.65,
-                tickfont=dict(size=10, color="#64748b"),
+                tickfont=dict(size=10, color=C["muted"]),
             ),
             cmin=float(np.percentile(result["rand_sharpes"], 5)),
             cmax=float(np.percentile(result["rand_sharpes"], 95)),
@@ -1220,47 +1141,44 @@ def build_ef_chart(result: dict) -> go.Figure:
         hovertemplate="波动率: %{x:.1%}<br>收益率: %{y:.1%}<extra></extra>",
     ))
 
-    # Efficient frontier curve
     if result["frontier"]:
         ef_v = [p[0] for p in result["frontier"]]
         ef_r = [p[1] for p in result["frontier"]]
         fig.add_trace(go.Scatter(
             x=ef_v, y=ef_r, mode="lines",
-            line=dict(color="#a78bfa", width=2.5),
+            line=dict(color=C["accent2"], width=2.5),
             name="有效前沿",
         ))
 
-    # Min-vol portfolio
     fig.add_trace(go.Scatter(
         x=[result["mv_vol"]], y=[result["mv_ret"]],
         mode="markers+text",
-        marker=dict(size=14, color="#f59e0b", symbol="diamond",
-                    line=dict(color="#0a0e1a", width=2)),
+        marker=dict(size=14, color=C["warn"], symbol="diamond",
+                    line=dict(color=C["bg"], width=2)),
         text=["最小波动"], textposition="top right",
-        textfont=dict(size=10, color="#f59e0b"),
+        textfont=dict(size=10, color=C["warn"]),
         name=f"最小波动  Sharpe {result['mv_sharpe']:.2f}",
     ))
 
-    # Max-Sharpe portfolio
     fig.add_trace(go.Scatter(
         x=[result["vol"]], y=[result["ret"]],
         mode="markers+text",
-        marker=dict(size=16, color="#10b981", symbol="star",
-                    line=dict(color="#0a0e1a", width=2)),
+        marker=dict(size=16, color=C["up"], symbol="star",
+                    line=dict(color=C["bg"], width=2)),
         text=["最优夏普"], textposition="top right",
-        textfont=dict(size=10, color="#10b981"),
+        textfont=dict(size=10, color=C["up"]),
         name=f"最优夏普  Sharpe {result['sharpe']:.2f}",
     ))
 
     fig.update_layout(
         height=420,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
-        xaxis=dict(title="年化波动率", gridcolor="#1e2d4a",
-                   zerolinecolor="#1e2d4a", tickformat=".0%"),
-        yaxis=dict(title="年化预期收益率", gridcolor="#1e2d4a",
-                   zerolinecolor="#1e2d4a", tickformat=".0%"),
-        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(title="年化波动率", gridcolor=C["border"],
+                   zerolinecolor=C["border"], tickformat=".0%"),
+        yaxis=dict(title="年化预期收益率", gridcolor=C["border"],
+                   zerolinecolor=C["border"], tickformat=".0%"),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
                     font=dict(size=11), x=0.01, y=0.99, xanchor="left"),
         margin=dict(l=0, r=20, t=10, b=0),
         hovermode="closest",
@@ -1268,8 +1186,8 @@ def build_ef_chart(result: dict) -> go.Figure:
     return fig
 
 
-def build_weight_chart(result: dict) -> go.Figure:
-    palette = ["#6366f1", "#10b981", "#f59e0b", "#f43f5e", "#a78bfa", "#34d399"]
+def build_weight_chart(result: dict, C: dict) -> go.Figure:
+    palette = [C["accent"], C["up"], C["warn"], C["down"], C["accent2"], "#34d399"]
     items = sorted(
         [(k, v) for k, v in result["weights"].items() if v > 0.001],
         key=lambda x: -x[1],
@@ -1281,7 +1199,7 @@ def build_weight_chart(result: dict) -> go.Figure:
         labels=labels, values=values,
         hole=0.58,
         marker=dict(colors=palette[:len(labels)],
-                    line=dict(color="#0a0e1a", width=3)),
+                    line=dict(color=C["bg"], width=3)),
         textinfo="label+percent",
         textfont=dict(family="Space Mono, monospace", size=12),
         hovertemplate="%{label}: %{value:.1%}<extra></extra>",
@@ -1289,14 +1207,14 @@ def build_weight_chart(result: dict) -> go.Figure:
     ))
     fig.update_layout(
         height=300,
-        paper_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        paper_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
         margin=dict(l=0, r=0, t=10, b=0),
         showlegend=False,
         annotations=[dict(
             text=f"Sharpe<br><b>{result['sharpe']:.2f}</b>",
             x=0.5, y=0.5, font_size=13, showarrow=False,
-            font=dict(color="#a78bfa", family="Space Mono, monospace"),
+            font=dict(color=C["accent2"], family="Space Mono, monospace"),
         )],
     )
     return fig
@@ -1339,12 +1257,11 @@ def compute_risk_metrics(df: pd.DataFrame, spy_close: pd.Series, beta_from_info:
     return {"ann_vol": ann_vol, "beta": beta, "corr": corr}
 
 
-def build_comparison_chart(df: pd.DataFrame, spy_close: pd.Series, ticker: str) -> go.Figure:
-    # Trim stock to last 6 months
+def build_comparison_chart(df: pd.DataFrame, spy_close: pd.Series, ticker: str, C: dict) -> go.Figure:
     cutoff = df.index[-1] - pd.DateOffset(months=6)
     stock_6m = df["Close"][df.index >= cutoff]
-
     stock_norm = stock_6m / float(stock_6m.iloc[0])
+    spy_norm = pd.Series(dtype=float)
 
     fig = go.Figure()
 
@@ -1353,39 +1270,38 @@ def build_comparison_chart(df: pd.DataFrame, spy_close: pd.Series, ticker: str) 
         spy_norm = spy_aligned / float(spy_aligned.iloc[0])
         fig.add_trace(go.Scatter(
             x=spy_norm.index, y=spy_norm.values, name="SPY",
-            line=dict(color="#64748b", width=1.5, dash="dot"),
+            line=dict(color=C["muted"], width=1.5, dash="dot"),
         ))
 
-    stock_color = "#6366f1"
     fig.add_trace(go.Scatter(
         x=stock_norm.index, y=stock_norm.values, name=ticker,
-        line=dict(color=stock_color, width=2.5),
+        line=dict(color=C["accent"], width=2.5),
         fill="tozeroy", fillcolor="rgba(99,102,241,0.06)",
     ))
 
     final_ret = float(stock_norm.iloc[-1] - 1)
-    spy_ret = float(spy_norm.iloc[-1] - 1) if not spy_close.empty and len(spy_norm) else None
+    spy_ret = float(spy_norm.iloc[-1] - 1) if not spy_norm.empty else None
     subtitle = f"{ticker} {final_ret:+.1%}"
     if spy_ret is not None:
         subtitle += f"  vs  SPY {spy_ret:+.1%}"
 
     fig.update_layout(
         height=260,
-        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
-        xaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
-        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", title="净值 (起始=1)", tickformat=".2f"),
-        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"], title="净值 (起始=1)", tickformat=".2f"),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
                     orientation="h", y=1.12, font=dict(size=11)),
         margin=dict(l=0, r=0, t=10, b=0),
         hovermode="x unified",
-        title=dict(text=subtitle, font=dict(size=13, color="#94a3b8"), x=0, xanchor="left", pad=dict(b=4)),
+        title=dict(text=subtitle, font=dict(size=13, color=C["muted"]), x=0, xanchor="left", pad=dict(b=4)),
     )
-    fig.add_hline(y=1.0, line_dash="dash", line_color="#334155", opacity=0.6)
+    fig.add_hline(y=1.0, line_dash="dash", line_color=C["border"], opacity=0.8)
     return fig
 
 
-def build_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
+def build_chart(df: pd.DataFrame, ticker: str, C: dict) -> go.Figure:
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
@@ -1394,78 +1310,75 @@ def build_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
         subplot_titles=("价格 & 均线 & 布林带", "MACD", "RSI")
     )
 
-    # ── Row 1: Candlestick + BB + MA ─────────────────────────────────────────
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
         low=df["Low"], close=df["Close"],
         name="K线",
-        increasing_line_color="#10b981",
-        decreasing_line_color="#f43f5e",
-        increasing_fillcolor="#10b981",
-        decreasing_fillcolor="#f43f5e",
+        increasing_line_color=C["up"],
+        decreasing_line_color=C["down"],
+        increasing_fillcolor=C["up"],
+        decreasing_fillcolor=C["down"],
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=df.index, y=df["BB_Upper"], name="BB上轨",
-        line=dict(color="#6366f1", width=1, dash="dot"), opacity=0.6), row=1, col=1)
+        line=dict(color=C["accent"], width=1, dash="dot"), opacity=0.6), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["BB_Lower"], name="BB下轨",
-        line=dict(color="#6366f1", width=1, dash="dot"), opacity=0.6,
+        line=dict(color=C["accent"], width=1, dash="dot"), opacity=0.6,
         fill="tonexty", fillcolor="rgba(99,102,241,0.05)"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], name="MA20",
-        line=dict(color="#f59e0b", width=1.5)), row=1, col=1)
+        line=dict(color=C["warn"], width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MA50"], name="MA50",
-        line=dict(color="#3b82f6", width=1.5)), row=1, col=1)
+        line=dict(color=C["blue"], width=1.5)), row=1, col=1)
 
-    # ── Row 2: MACD ───────────────────────────────────────────────────────────
-    colors = ["#10b981" if v >= 0 else "#f43f5e" for v in df["MACD_Hist"]]
+    macd_colors = [C["up"] if v >= 0 else C["down"] for v in df["MACD_Hist"]]
     fig.add_trace(go.Bar(x=df.index, y=df["MACD_Hist"], name="MACD柱",
-        marker_color=colors, opacity=0.7), row=2, col=1)
+        marker_color=macd_colors, opacity=0.7), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD",
-        line=dict(color="#3b82f6", width=1.5)), row=2, col=1)
+        line=dict(color=C["blue"], width=1.5)), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD_Signal"], name="Signal",
-        line=dict(color="#f59e0b", width=1.5)), row=2, col=1)
+        line=dict(color=C["warn"], width=1.5)), row=2, col=1)
 
-    # ── Row 3: RSI ────────────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI",
-        line=dict(color="#a78bfa", width=2)), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="#f43f5e", opacity=0.5, row=3, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="#10b981", opacity=0.5, row=3, col=1)
+        line=dict(color=C["accent2"], width=2)), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color=C["down"], opacity=0.5, row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color=C["up"], opacity=0.5, row=3, col=1)
 
     fig.update_layout(
         height=680,
-        paper_bgcolor="#0a0e1a",
-        plot_bgcolor="#0a0e1a",
-        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        paper_bgcolor=C["bg"],
+        plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
         xaxis_rangeslider_visible=False,
         showlegend=True,
         legend=dict(
-            bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+            bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
             font=dict(size=11), orientation="h", y=1.02
         ),
         margin=dict(l=0, r=0, t=40, b=0),
     )
     for i in range(1, 4):
-        fig.update_xaxes(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", row=i, col=1)
-        fig.update_yaxes(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", row=i, col=1)
+        fig.update_xaxes(gridcolor=C["border"], zerolinecolor=C["border"], row=i, col=1)
+        fig.update_yaxes(gridcolor=C["border"], zerolinecolor=C["border"], row=i, col=1)
 
     return fig
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ 参数配置")
+    st.markdown("### 参数配置")
     ticker = st.text_input("股票代码", value="AAPL", placeholder="AAPL / TSLA / NVDA").upper().strip()
     period = st.selectbox("回看周期", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
     api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
 
     st.markdown("---")
-    st.markdown("### 🔁 回测参数")
+    st.markdown("### 回测参数")
     holding_days = st.slider("最长持仓天数", min_value=3, max_value=20, value=5, step=1)
     stop_loss_pct = st.slider("止损比例", min_value=1, max_value=10, value=3, step=1, format="%d%%")
     take_profit_pct = st.slider("止盈比例", min_value=1, max_value=20, value=5, step=1, format="%d%%")
     slippage_pct = st.slider("滑点", min_value=0.0, max_value=1.0, value=0.1, step=0.05, format="%.2f%%")
     commission_pct = st.slider("手续费（单边）", min_value=0.0, max_value=0.5, value=0.1, step=0.05, format="%.2f%%")
 
-    run_btn = st.button("🚀 开始分析")
+    run_btn = st.button("开始分析")
 
     st.markdown("---")
     st.markdown("**快捷股票**")
@@ -1479,17 +1392,18 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("""
     <div style='font-size:11px; color:#4a5568; line-height:1.6;'>
-    ⚠️ 本工具仅供学习研究，不构成任何投资建议。股市有风险，投资须谨慎。
+    本工具仅供学习研究，不构成任何投资建议。股市有风险，投资须谨慎。
     </div>
     """, unsafe_allow_html=True)
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <div class='header-banner'>
-  <h1 style='margin:0; font-size:28px; color:#e2e8f0;'>📈 QuantAI · 股票分析系统</h1>
-  <p style='margin:8px 0 0; color:#64748b; font-size:14px;'>
-    技术指标 · AI解读 · 买卖信号 &nbsp;|&nbsp; 数据来源：Yahoo Finance &nbsp;|&nbsp; AI：Claude
+  <div style='font-family:Space Mono,monospace;font-size:11px;color:{C["muted"]};letter-spacing:2px;margin-bottom:6px;'>QUANTAI TERMINAL</div>
+  <h1 style='margin:0;font-size:24px;color:{C["text"]};font-family:Space Mono,monospace;font-weight:700;'>股票量化分析系统</h1>
+  <p style='margin:6px 0 0;color:{C["muted"]};font-size:13px;'>
+    技术指标 · AI 解读 · 买卖信号 &nbsp;·&nbsp; Yahoo Finance &nbsp;·&nbsp; Claude AI
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -1498,11 +1412,11 @@ if run_btn:
     st.session_state["analysis_active"] = True
 
 if not st.session_state.get("analysis_active"):
-    st.markdown("""
-    <div style='text-align:center; padding:80px 0; color:#4a5568;'>
-      <div style='font-size:48px; margin-bottom:16px;'>🔍</div>
-      <div style='font-family: Space Mono, monospace; font-size:16px;'>在左侧输入股票代码，点击开始分析</div>
-      <div style='font-size:13px; margin-top:8px;'>支持所有美股代码：AAPL · TSLA · NVDA · MSFT ···</div>
+    st.markdown(f"""
+    <div style='text-align:center; padding:80px 0; color:{C["muted"]};'>
+      <div style='font-family:Space Mono,monospace;font-size:13px;letter-spacing:2px;margin-bottom:12px;color:{C["dim"]};'>QUANTAI TERMINAL</div>
+      <div style='font-family:Space Mono,monospace;font-size:16px;color:{C["text"]};'>在左侧输入股票代码，点击开始分析</div>
+      <div style='font-size:13px; margin-top:8px;color:{C["dim"]};'>支持所有美股代码：AAPL · TSLA · NVDA · MSFT ···</div>
     </div>
     """, unsafe_allow_html=True)
     st.stop()
@@ -1631,7 +1545,7 @@ risk_cards = [
      ("#f43f5e" if risk["beta"] and abs(risk["beta"]) > 1.5 else "#f59e0b" if risk["beta"] and abs(risk["beta"]) > 1.0 else "#10b981")),
     (rc3, "与SPY相关性", f"{risk['corr']:.2f}" if risk["corr"] is not None else "N/A",
      ("强相关" if risk["corr"] and abs(risk["corr"]) > 0.7 else "中相关" if risk["corr"] and abs(risk["corr"]) > 0.4 else "弱相关"),
-     ("#94a3b8" if risk["corr"] and abs(risk["corr"]) > 0.7 else "#a78bfa" if risk["corr"] and abs(risk["corr"]) > 0.4 else "#34d399")),
+     (C["dim"] if risk["corr"] and abs(risk["corr"]) > 0.7 else C["accent2"] if risk["corr"] and abs(risk["corr"]) > 0.4 else C["up"])),
     (rc4, "综合风险等级", rl_label, "", rl_color),
 ]
 for col, lbl, val, badge, color in risk_cards:
@@ -1649,9 +1563,9 @@ st.markdown("<br>", unsafe_allow_html=True)
 signal, reasons = get_signal(df)
 
 signal_styles = {
-    "BUY":  ("signal-buy",  "🟢 BUY · 买入",  "#10b981"),
-    "SELL": ("signal-sell", "🔴 SELL · 卖出", "#f43f5e"),
-    "HOLD": ("signal-hold", "⚪ HOLD · 观望", "#a8a29e"),
+    "BUY":  ("signal-buy",  "BUY · 买入",  C["up"]),
+    "SELL": ("signal-sell", "SELL · 卖出", C["down"]),
+    "HOLD": ("signal-hold", "HOLD · 观望", C["muted"]),
 }
 css_class, label, color = signal_styles[signal]
 
@@ -1660,7 +1574,7 @@ with col_sig:
     st.markdown(f"""
     <div class='{css_class}'>
       <div style='font-size:22px; font-weight:700; color:{color};'>{label}</div>
-      <div style='font-size:11px; color:#94a3b8; margin-top:6px;'>综合技术信号</div>
+      <div style='font-size:11px; color:{C["muted"]}; margin-top:6px;'>综合技术信号</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1672,25 +1586,28 @@ with col_reasons:
 st.markdown("---")
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
-st.markdown("### 📊 技术图表")
-fig = build_chart(df, ticker)
+st.markdown("### 技术图表")
+fig = build_chart(df, ticker, C)
 st.plotly_chart(fig, width="stretch")
 
 # ── Market Comparison ────────────────────────────────────────────────────────
-st.markdown("### 📈 大盘对比（近6个月收益率）")
+st.markdown("### 大盘对比（近6个月收益率）")
 if spy_close.empty:
-    st.warning("⚠️ 无法加载 SPY 数据，大盘对比图暂不可用。")
+    st.warning("无法加载 SPY 数据，大盘对比图暂不可用。")
 else:
-    cmp_fig = build_comparison_chart(df, spy_close, ticker)
+    cmp_fig = build_comparison_chart(df, spy_close, ticker, C)
     st.plotly_chart(cmp_fig, width="stretch")
 
 # ── Backtest ─────────────────────────────────────────────────────────────────
+_bt_muted = C["muted"]
+_bt_down = C["down"]
+_bt_up = C["up"]
 st.markdown(
-    f"### 🔁 策略回测 "
-    f"<span style='font-size:13px; color:#64748b; font-family:DM Sans,sans-serif; font-weight:400;'>"
+    f"### 策略回测 "
+    f"<span style='font-size:13px; color:{_bt_muted}; font-family:DM Sans,sans-serif; font-weight:400;'>"
     f"持仓 {holding_days}日 &nbsp;·&nbsp; "
-    f"止损 <span style='color:#f43f5e;'>-{stop_loss_pct}%</span> &nbsp;·&nbsp; "
-    f"止盈 <span style='color:#10b981;'>+{take_profit_pct}%</span> &nbsp;·&nbsp; "
+    f"止损 <span style='color:{_bt_down};'>-{stop_loss_pct}%</span> &nbsp;·&nbsp; "
+    f"止盈 <span style='color:{_bt_up};'>+{take_profit_pct}%</span> &nbsp;·&nbsp; "
     f"滑点 {slippage_pct:.2f}% &nbsp;·&nbsp; 手续费 {commission_pct:.2f}%"
     f"</span>",
     unsafe_allow_html=True,
@@ -1742,11 +1659,10 @@ else:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Equity curve ──────────────────────────────────────────────────────────
-    bt_fig = build_backtest_chart(bt["equity"], df, bt["trades"])
+    bt_fig = build_backtest_chart(bt["equity"], df, bt["trades"], C)
     st.plotly_chart(bt_fig, width="stretch")
 
-    # ── Trade log ─────────────────────────────────────────────────────────────
-    with st.expander("📋 查看交易记录"):
+    with st.expander("查看交易记录"):
         tdf = bt["trades"].copy()
         tdf["return"] = tdf["return"].map(lambda x: f"{x:+.2%}")
         tdf.columns = ["买入日期", "卖出日期", "买入价", "卖出价", "收益率", "持仓天数", "退出原因"]
@@ -1763,7 +1679,7 @@ _daily_ret = df["Close"].pct_change().dropna()
 _mu  = round(float(_daily_ret.mean()), 8)
 _sig = round(float(_daily_ret.std()),  8)
 
-mc_tab, garch_tab = st.tabs(["🎲 蒙特卡洛模拟（30天·1000条路径）", "📊 GARCH 波动率预测"])
+mc_tab, garch_tab = st.tabs(["蒙特卡洛模拟（30天·1000条路径）", "GARCH 波动率预测"])
 
 with mc_tab:
     with st.spinner("正在运行 1000 条路径模拟..."):
@@ -1797,13 +1713,13 @@ with mc_tab:
 
     ch_col, dist_col = st.columns([3, 2])
     with ch_col:
-        st.plotly_chart(build_mc_chart(mc, ticker), width="stretch")
+        st.plotly_chart(build_mc_chart(mc, ticker, C), width="stretch")
     with dist_col:
         st.markdown(
-            "<div style='font-size:12px;color:#64748b;margin-bottom:8px;'>30日后收益区间概率分布</div>",
+            f"<div style='font-size:12px;color:{C['muted']};margin-bottom:8px;'>30日后收益区间概率分布</div>",
             unsafe_allow_html=True,
         )
-        st.plotly_chart(build_mc_dist_chart(mc), width="stretch")
+        st.plotly_chart(build_mc_dist_chart(mc, C), width="stretch")
 
 with garch_tab:
     with st.spinner("正在拟合 GARCH(1,1) 模型..."):
@@ -1839,22 +1755,22 @@ with garch_tab:
         hist_col, fc_col = st.columns(2)
         with hist_col:
             st.markdown(
-                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
                 "历史波动率 vs GARCH 条件波动率</div>",
                 unsafe_allow_html=True,
             )
-            st.plotly_chart(build_garch_hist_chart(g), width="stretch")
+            st.plotly_chart(build_garch_hist_chart(g, C), width="stretch")
         with fc_col:
             st.markdown(
-                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
                 "未来 30 天年化波动率预测</div>",
                 unsafe_allow_html=True,
             )
-            st.plotly_chart(build_garch_forecast_chart(g), width="stretch")
+            st.plotly_chart(build_garch_forecast_chart(g, C), width="stretch")
 
         # ── Model params ──────────────────────────────────────────────────
         st.markdown(
-            f"<div style='font-size:11px;color:#475569;margin-top:4px;'>"
+            f"<div style='font-size:11px;color:{C['dim']};margin-top:4px;'>"
             f"GARCH(1,1) 参数 &nbsp;·&nbsp; "
             f"α (ARCH) = {g['alpha']:.5f} &nbsp;·&nbsp; "
             f"β (GARCH) = {g['beta']:.5f} &nbsp;·&nbsp; "
@@ -1868,17 +1784,15 @@ st.markdown("---")
 # ── Portfolio Optimization ────────────────────────────────────────────────────
 _palette = ["#6366f1", "#10b981", "#f59e0b", "#f43f5e", "#a78bfa", "#34d399"]
 
-with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=True):
+with st.expander("投资组合优化（最大化夏普比率）", expanded=True):
 
-    # st.form batches all widget changes; only the submit button triggers a rerun,
-    # so this section never resets the rest of the page.
     with st.form("portfolio_form"):
         po_raw = st.text_input(
             "输入 2–6 只股票代码（逗号分隔，使用 2 年历史数据）",
             value=st.session_state.get("po_input", f"{ticker}, MSFT, GOOGL"),
             placeholder="AAPL, MSFT, GOOGL, NVDA",
         )
-        po_submitted = st.form_submit_button("🔧 开始优化", width="stretch")
+        po_submitted = st.form_submit_button("开始优化", width="stretch")
 
     if po_submitted:
         _cleaned = tuple(dict.fromkeys(
@@ -1913,7 +1827,7 @@ with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=
                 (pm1, "预期年化收益",   f"{_po['ret']:+.2%}",   "最优夏普组合",   "#10b981" if _po["ret"] > 0 else "#f43f5e"),
                 (pm2, "预期年化波动率", f"{_po['vol']:.2%}",    "年化标准差",     "#f59e0b"),
                 (pm3, "预期夏普比率",   f"{_po['sharpe']:.2f}", "无风险利率 5%",  "#a78bfa"),
-                (pm4, "有效配置资产",   f"{_n_active} 只",      f"共 {len(_po['tickers'])} 只输入", "#64748b"),
+                (pm4, "有效配置资产",   f"{_n_active} 只",      f"共 {len(_po['tickers'])} 只输入", C["muted"]),
             ]
             for col, lbl, val, sub, color in _po_cards:
                 col.markdown(f"""
@@ -1945,21 +1859,21 @@ with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=
             ef_col, wt_col = st.columns([3, 2])
             with ef_col:
                 st.markdown(
-                    "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                    f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
                     "有效前沿（散点颜色 = 夏普比率，绿星 = 最优，黄钻 = 最小波动）</div>",
                     unsafe_allow_html=True,
                 )
-                st.plotly_chart(build_ef_chart(_po), width="stretch")
+                st.plotly_chart(build_ef_chart(_po, C), width="stretch")
             with wt_col:
                 st.markdown(
-                    "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                    f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
                     "最优权重分配</div>",
                     unsafe_allow_html=True,
                 )
-                st.plotly_chart(build_weight_chart(_po), width="stretch")
+                st.plotly_chart(build_weight_chart(_po, C), width="stretch")
 
             # ── Min-vol comparison ─────────────────────────────────────────
-            with st.expander("📋 对比：最小波动组合"):
+            with st.expander("对比：最小波动组合"):
                 _mv_active = sorted(
                     [(k, v) for k, v in _po["mv_weights"].items() if v > 0.001],
                     key=lambda x: -x[1],
@@ -1973,7 +1887,7 @@ with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=
                       <div class='bt-sub'>最小波动配比</div>
                     </div>""", unsafe_allow_html=True)
                 st.markdown(
-                    f"<div style='font-size:12px;color:#64748b;margin-top:12px;'>"
+                    f"<div style='font-size:12px;color:{C['muted']};margin-top:12px;'>"
                     f"预期收益 {_po['mv_ret']:+.2%} &nbsp;·&nbsp; "
                     f"波动率 {_po['mv_vol']:.2%} &nbsp;·&nbsp; "
                     f"夏普 {_po['mv_sharpe']:.2f}</div>",
@@ -1983,7 +1897,7 @@ with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=
 st.markdown("---")
 
 # ── Earnings & Insider Trading ────────────────────────────────────────────────
-st.markdown("### 📅 财报 & 内部人交易")
+st.markdown("### 财报 & 内部人交易")
 
 with st.spinner("获取财报和内部人数据..."):
     ei = fetch_earnings_and_insider(ticker)
@@ -2000,30 +1914,29 @@ else:
             days = earn["days_until"]
             days_str = (f"还有 {days} 天" if days is not None and days >= 0
                         else ("已过" if days is not None else ""))
-            date_color = ("#f59e0b" if days is not None and days <= 30
-                          else "#e2e8f0")
+            date_color = C["warn"] if days is not None and days <= 30 else C["text"]
             st.markdown(f"""
             <div class='bt-card' style='text-align:left;padding:18px 20px;'>
-              <div style='font-size:11px;color:#64748b;margin-bottom:6px;'>下次财报日期</div>
+              <div style='font-size:11px;color:{C["muted"]};margin-bottom:6px;'>下次财报日期</div>
               <div style='font-family:Space Mono,monospace;font-size:22px;
                           font-weight:700;color:{date_color};'>{earn["next_date"]}</div>
-              <div style='font-size:12px;color:#f59e0b;margin-top:4px;'>{days_str}</div>
-              <hr style='border-color:#1e2d4a;margin:12px 0;'>
-              <div style='font-size:11px;color:#64748b;margin-bottom:4px;'>EPS 预期</div>
+              <div style='font-size:12px;color:{C["warn"]};margin-top:4px;'>{days_str}</div>
+              <hr style='border-color:{C["border"]};margin:12px 0;'>
+              <div style='font-size:11px;color:{C["muted"]};margin-bottom:4px;'>EPS 预期</div>
               <div style='font-family:Space Mono,monospace;font-size:18px;
-                          font-weight:700;color:#a78bfa;'>
+                          font-weight:700;color:{C["accent2"]};'>
                 {"${:.2f}".format(float(earn["eps_avg"])) if earn["eps_avg"] is not None else "N/A"}
               </div>
-              <div style='font-size:11px;color:#475569;margin-top:2px;'>
+              <div style='font-size:11px;color:{C["dim"]};margin-top:2px;'>
                 低 {"${:.2f}".format(float(earn["eps_low"])) if earn["eps_low"] is not None else "—"}
                 &nbsp;·&nbsp;
                 高 {"${:.2f}".format(float(earn["eps_high"])) if earn["eps_high"] is not None else "—"}
               </div>
-              <hr style='border-color:#1e2d4a;margin:12px 0;'>
-              <div style='font-size:11px;color:#64748b;margin-bottom:4px;'>营收预期</div>
+              <hr style='border-color:{C["border"]};margin:12px 0;'>
+              <div style='font-size:11px;color:{C["muted"]};margin-bottom:4px;'>营收预期</div>
               <div style='font-family:Space Mono,monospace;font-size:16px;
-                          font-weight:700;color:#e2e8f0;'>{earn["rev_avg"]}</div>
-              <div style='font-size:11px;color:#475569;margin-top:2px;'>
+                          font-weight:700;color:{C["text"]};'>{earn["rev_avg"]}</div>
+              <div style='font-size:11px;color:{C["dim"]};margin-top:2px;'>
                 低 {earn["rev_low"]} &nbsp;·&nbsp; 高 {earn["rev_high"]}
               </div>
             </div>""", unsafe_allow_html=True)
@@ -2048,7 +1961,7 @@ else:
                     return "color:#10b981;font-weight:600"
                 if val == "卖出":
                     return "color:#f43f5e;font-weight:600"
-                return "color:#64748b"
+                return f"color:{C['muted']}"
 
             styled = (
                 insider_df.style
@@ -2056,7 +1969,7 @@ else:
                 .map(_style_type, subset=["类型"])
             )
             st.markdown(
-                "<div style='font-size:12px;color:#64748b;margin-bottom:6px;'>"
+                f"<div style='font-size:12px;color:{C['muted']};margin-bottom:6px;'>"
                 "最近 10 条内部人交易记录</div>",
                 unsafe_allow_html=True,
             )
@@ -2067,7 +1980,7 @@ else:
 st.markdown("---")
 
 # ── News Sentiment ────────────────────────────────────────────────────────────
-st.markdown("### 📰 新闻情绪分析")
+st.markdown("### 新闻情绪分析")
 
 with st.spinner("抓取最新新闻..."):
     news_items = fetch_news(ticker)
@@ -2088,7 +2001,7 @@ else:
                 elif sc >= 10:
                     sc_color, sc_label = "#34d399", "中性偏多"
                 elif sc >= -10:
-                    sc_color, sc_label = "#94a3b8", "中性"
+                    sc_color, sc_label = C["dim"], "中性"
                 elif sc >= -40:
                     sc_color, sc_label = "#f97316", "中性偏空"
                 else:
@@ -2124,7 +2037,7 @@ else:
             except Exception as e:
                 st.error(f"情绪分析失败：{e}")
     else:
-        st.info("💡 输入 API Key 后启用情绪分析（-100 到 +100 评分）。")
+        st.info("输入 API Key 后启用情绪分析（-100 到 +100 评分）。")
 
     # ── News headlines ────────────────────────────────────────────────────────
     for n in news_items:
@@ -2143,45 +2056,45 @@ else:
 st.markdown("---")
 
 # ── AI Analysis ───────────────────────────────────────────────────────────────
-st.markdown("### 🤖 AI 深度分析")
+st.markdown("### AI 深度分析")
 
 if not api_key:
     rule_report = generate_rule_report(ticker, df, signal, info)
-    st.markdown("""
+    st.markdown(f"""
     <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
-      <span style='background:#1e2d4a;color:#94a3b8;font-size:11px;padding:3px 10px;
+      <span style='background:{C["border"]};color:{C["muted"]};font-size:11px;padding:3px 10px;
                    border-radius:4px;font-family:Space Mono,monospace;'>规则驱动</span>
-      <span style='font-size:12px;color:#475569;'>输入 API Key 后切换为 Claude 深度分析</span>
+      <span style='font-size:12px;color:{C["dim"]};'>输入 API Key 后切换为 Claude 深度分析</span>
     </div>""", unsafe_allow_html=True)
     st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
 else:
     with st.spinner("Claude 正在分析中..."):
         try:
             report = get_ai_analysis(ticker, df, signal, reasons, api_key)
-            st.markdown("""
+            st.markdown(f"""
             <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
-              <span style='background:#1e1b4b;color:#a78bfa;font-size:11px;padding:3px 10px;
-                           border-radius:4px;font-family:Space Mono,monospace;'>Claude AI</span>
+              <span style='background:{C["surface"]};color:{C["accent2"]};font-size:11px;padding:3px 10px;
+                           border:1px solid {C["border"]};border-radius:4px;font-family:Space Mono,monospace;'>Claude AI</span>
             </div>""", unsafe_allow_html=True)
             st.markdown(f"<div class='ai-report'>{report}</div>", unsafe_allow_html=True)
         except Exception as e:
             st.error(f"Claude 分析失败：{e}")
             rule_report = generate_rule_report(ticker, df, signal, info)
-            st.markdown("""
+            st.markdown(f"""
             <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
-              <span style='background:#1e2d4a;color:#94a3b8;font-size:11px;padding:3px 10px;
+              <span style='background:{C["border"]};color:{C["muted"]};font-size:11px;padding:3px 10px;
                            border-radius:4px;font-family:Space Mono,monospace;'>规则驱动（回退）</span>
             </div>""", unsafe_allow_html=True)
             st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
 
 # ── Raw data ──────────────────────────────────────────────────────────────────
-with st.expander("📋 查看原始数据"):
+with st.expander("查看原始数据"):
     show_df = df[["Open", "High", "Low", "Close", "Volume", "MA20", "MA50", "RSI", "MACD"]].tail(30)
     show_df = show_df.round(3)
     st.dataframe(show_df, width="stretch")
 
-st.markdown("""
-<div style='text-align:center; padding:32px 0 16px; color:#334155; font-size:12px;'>
-  QuantAI · 技术分析仅供学习研究 · 不构成投资建议 · 数据延迟15分钟
+st.markdown(f"""
+<div style='text-align:center; padding:32px 0 16px; color:{C["dim"]}; font-size:12px; font-family:Space Mono,monospace; letter-spacing:0.5px;'>
+  QUANTAI · 技术分析仅供学习研究 · 不构成投资建议 · 数据延迟15分钟
 </div>
 """, unsafe_allow_html=True)
