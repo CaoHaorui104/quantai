@@ -1363,6 +1363,260 @@ def build_chart(df: pd.DataFrame, ticker: str, C: dict) -> go.Figure:
     return fig
 
 
+# ── ML Price Prediction ───────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300)
+def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple) -> dict:
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        return {"error": "sklearn_missing"}
+
+    HORIZON = 5
+    MIN_ROWS = 80
+
+    try:
+        X = np.array(feat_rows)
+        closes = np.array(close_tuple)
+        n = len(X)
+
+        if n < MIN_ROWS + HORIZON:
+            return {"error": "insufficient_data"}
+
+        # Multi-horizon targets: forward return at day h (h = 1..5)
+        valid_n = n - HORIZON
+        X_v = X[:valid_n]
+        y = np.zeros((valid_n, HORIZON))
+        for h in range(1, HORIZON + 1):
+            y[:, h - 1] = (closes[h: valid_n + h] - closes[:valid_n]) / closes[:valid_n]
+
+        # Time-ordered 80/20 split
+        split = max(MIN_ROWS, int(valid_n * 0.80))
+        if split >= valid_n:
+            return {"error": "insufficient_data"}
+
+        X_tr, y_tr = X_v[:split], y[:split]
+        X_te, y_te = X_v[split:], y[split:]
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_te)
+
+        # Ridge regression
+        lr = Ridge(alpha=1.0)
+        lr.fit(X_tr_s, y_tr)
+        lr_te = lr.predict(X_te_s)
+
+        # Random Forest (100 trees, moderate depth)
+        rf = RandomForestRegressor(
+            n_estimators=100, max_depth=5,
+            min_samples_leaf=4, random_state=42, n_jobs=-1,
+        )
+        rf.fit(X_tr_s, y_tr)
+        rf_te = rf.predict(X_te_s)
+
+        # Directional accuracy on 5-day horizon
+        def _dir_acc(pred, actual):
+            return float(np.mean(np.sign(pred[:, -1]) == np.sign(actual[:, -1])))
+
+        rf_acc = _dir_acc(rf_te, y_te)
+        lr_acc = _dir_acc(lr_te, y_te)
+        rf_mae = float(np.mean(np.abs(rf_te[:, -1] - y_te[:, -1])) * 100)
+        lr_mae = float(np.mean(np.abs(lr_te[:, -1] - y_te[:, -1])) * 100)
+
+        # Retrain on all data for future forecast
+        scaler2 = StandardScaler()
+        X_all_s = scaler2.fit_transform(X_v)
+
+        rf2 = RandomForestRegressor(
+            n_estimators=100, max_depth=5,
+            min_samples_leaf=4, random_state=42, n_jobs=-1,
+        )
+        rf2.fit(X_all_s, y)
+
+        lr2 = Ridge(alpha=1.0)
+        lr2.fit(X_all_s, y)
+
+        x_now = scaler2.transform(X_v[[-1]])
+
+        # Per-tree predictions for confidence interval
+        tree_preds = np.array([est.predict(x_now)[0] for est in rf2.estimators_])
+        rf_mean = tree_preds.mean(axis=0)   # (HORIZON,)
+        rf_std  = tree_preds.std(axis=0)
+        lr_mean = lr2.predict(x_now)[0]
+
+        cur_close = float(closes[-1])
+        rf_prices = (cur_close * (1 + rf_mean)).tolist()
+        lr_prices = (cur_close * (1 + lr_mean)).tolist()
+        rf_upper  = (cur_close * (1 + rf_mean + 1.96 * rf_std)).tolist()
+        rf_lower  = (cur_close * (1 + rf_mean - 1.96 * rf_std)).tolist()
+
+        feat_names = ["RSI", "MACD", "MACD柱", "布林%B",
+                      "MA20比", "MA50比", "1日收益", "5日收益", "20日收益"]
+        importance = rf2.feature_importances_.tolist()
+
+        # OOS series for backtest display
+        test_dates = list(dates_tuple)[split: split + len(y_te)]
+        rf_oos_5d  = (rf_te[:, -1] * 100).tolist()
+        lr_oos_5d  = (lr_te[:, -1] * 100).tolist()
+        actual_5d  = (y_te[:, -1] * 100).tolist()
+
+        return {
+            "rf_prices": rf_prices, "lr_prices": lr_prices,
+            "rf_upper":  rf_upper,  "rf_lower":  rf_lower,
+            "cur_close": cur_close,
+            "rf_acc": rf_acc, "lr_acc": lr_acc,
+            "rf_mae": rf_mae, "lr_mae": lr_mae,
+            "feat_importance": list(zip(feat_names, importance)),
+            "test_dates": test_dates,
+            "rf_oos_5d": rf_oos_5d, "lr_oos_5d": lr_oos_5d,
+            "actual_5d": actual_5d,
+            "horizon": HORIZON, "n_train": split, "n_test": len(y_te),
+            "error": None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def build_ml_forecast_chart(ml: dict, df: pd.DataFrame, C: dict) -> go.Figure:
+    fig = go.Figure()
+
+    # Last 30 days actual prices
+    recent = df["Close"].tail(30)
+    fig.add_trace(go.Scatter(
+        x=list(recent.index), y=recent.tolist(), name="实际收盘价",
+        line=dict(color=C["accent"], width=2),
+    ))
+
+    # Next N trading days (skip weekends)
+    last_date = df.index[-1]
+    future_dates, d = [], last_date
+    while len(future_dates) < ml["horizon"]:
+        d = d + pd.Timedelta(days=1)
+        if d.weekday() < 5:
+            future_dates.append(d)
+
+    # Connect today → prediction
+    cx = [last_date] + future_dates
+    rf_y  = [ml["cur_close"]] + ml["rf_prices"]
+    lr_y  = [ml["cur_close"]] + ml["lr_prices"]
+    up_y  = [ml["cur_close"]] + ml["rf_upper"]
+    lo_y  = [ml["cur_close"]] + ml["rf_lower"]
+
+    # 95% confidence band
+    fig.add_trace(go.Scatter(
+        x=cx + cx[::-1], y=up_y + lo_y[::-1],
+        fill="toself", fillcolor="rgba(99,102,241,0.10)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="95% 置信区间", hoverinfo="skip",
+    ))
+
+    # Linear regression forecast
+    fig.add_trace(go.Scatter(
+        x=cx, y=lr_y, name="线性回归预测",
+        line=dict(color=C["warn"], width=1.5, dash="dash"),
+        mode="lines",
+    ))
+
+    # RF forecast
+    fig.add_trace(go.Scatter(
+        x=cx, y=rf_y, name="随机森林预测",
+        line=dict(color=C["up"], width=2.5),
+        mode="lines+markers",
+        marker=dict(size=7, color=C["up"]),
+    ))
+
+    # Today marker
+    fig.add_trace(go.Scatter(
+        x=[last_date], y=[ml["cur_close"]], name="今日收盘",
+        mode="markers",
+        marker=dict(size=10, color=C["accent2"], symbol="diamond",
+                    line=dict(color=C["bg"], width=2)),
+    ))
+
+    fig.add_vline(
+        x=last_date, line_dash="dot", line_color=C["dim"], opacity=0.7,
+        annotation_text="今日", annotation_font_color=C["muted"],
+        annotation_font_size=10,
+    )
+
+    fig.update_layout(
+        height=360,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"], title="价格 ($)"),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
+                    orientation="h", y=1.10, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def build_ml_importance_chart(ml: dict, C: dict) -> go.Figure:
+    feats = sorted(ml["feat_importance"], key=lambda x: x[1])
+    names = [f[0] for f in feats]
+    vals  = [f[1] * 100 for f in feats]
+
+    bar_colors = [C["accent"] if v >= max(vals) * 0.6 else C["border"] for v in vals]
+
+    fig = go.Figure(go.Bar(
+        x=vals, y=names, orientation="h",
+        marker_color=bar_colors,
+        text=[f"{v:.1f}%" for v in vals],
+        textposition="outside",
+        textfont=dict(family="Space Mono, monospace", size=11, color=C["text"]),
+        hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        height=280,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(title="重要性 (%)", gridcolor=C["border"],
+                   zerolinecolor=C["border"], range=[0, max(vals) * 1.40]),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+        margin=dict(l=0, r=55, t=0, b=0),
+        showlegend=False,
+    )
+    return fig
+
+
+def build_ml_backtest_chart(ml: dict, C: dict) -> go.Figure:
+    test_dates = [pd.Timestamp(d) for d in ml["test_dates"]]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=test_dates, y=ml["actual_5d"], name="实际5日收益",
+        line=dict(color=C["accent"], width=2),
+        fill="tozeroy", fillcolor="rgba(99,102,241,0.05)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=test_dates, y=ml["rf_oos_5d"], name="随机森林预测",
+        line=dict(color=C["up"], width=1.5, dash="dot"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=test_dates, y=ml["lr_oos_5d"], name="线性回归",
+        line=dict(color=C["warn"], width=1.5, dash="dash"),
+    ))
+    fig.add_hline(y=0, line_color=C["border"], opacity=0.8)
+
+    fig.update_layout(
+        height=220,
+        paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
+        xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"],
+                   title="5日收益率 (%)"),
+        legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
+                    orientation="h", y=1.12, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+    )
+    return fig
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 参数配置")
@@ -1674,12 +1928,53 @@ else:
 
 st.markdown("---")
 
-# ── Monte Carlo & GARCH (tabs) ────────────────────────────────────────────────
+# ── Monte Carlo / GARCH / ML (tabs) ──────────────────────────────────────────
 _daily_ret = df["Close"].pct_change().dropna()
 _mu  = round(float(_daily_ret.mean()), 8)
 _sig = round(float(_daily_ret.std()),  8)
 
-mc_tab, garch_tab = st.tabs(["蒙特卡洛模拟（30天·1000条路径）", "GARCH 波动率预测"])
+# ── Prepare ML features (needed before tabs so cache key is stable) ───────────
+_close_arr = df["Close"].values.astype(float)
+_n_ml = len(_close_arr)
+_rsi_arr      = df["RSI"].values.astype(float)
+_macd_arr     = df["MACD"].values.astype(float)
+_macd_h_arr   = df["MACD_Hist"].values.astype(float)
+_bb_u_arr     = df["BB_Upper"].values.astype(float)
+_bb_l_arr     = df["BB_Lower"].values.astype(float)
+_ma20_arr     = df["MA20"].values.astype(float)
+_ma50_arr     = df["MA50"].values.astype(float)
+
+_bb_width = np.where(_bb_u_arr - _bb_l_arr > 0, _bb_u_arr - _bb_l_arr, 1.0)
+_bb_pctb   = (_close_arr - _bb_l_arr) / _bb_width
+_ma20_r    = np.where(_close_arr > 0, _ma20_arr / _close_arr, 1.0)
+_ma50_r    = np.where(_close_arr > 0, _ma50_arr / _close_arr, 1.0)
+_macd_n    = np.where(_close_arr > 0, _macd_arr / _close_arr, 0.0)
+_macd_h_n  = np.where(_close_arr > 0, _macd_h_arr / _close_arr, 0.0)
+
+_ret1  = np.full(_n_ml, np.nan)
+_ret5  = np.full(_n_ml, np.nan)
+_ret20 = np.full(_n_ml, np.nan)
+_lc = np.log(np.where(_close_arr > 0, _close_arr, 1.0))
+_ret1[1:]   = _lc[1:] - _lc[:-1]
+if _n_ml > 5:
+    _ret5[5:]  = _lc[5:]  - _lc[:-5]
+if _n_ml > 20:
+    _ret20[20:] = _lc[20:] - _lc[:-20]
+
+_ml_feat = np.column_stack([
+    _rsi_arr / 100, _macd_n, _macd_h_n, _bb_pctb,
+    _ma20_r, _ma50_r, _ret1, _ret5, _ret20,
+])
+_ml_mask  = ~np.any(np.isnan(_ml_feat) | np.isinf(_ml_feat), axis=1)
+_ml_feat  = _ml_feat[_ml_mask]
+_ml_close = _close_arr[_ml_mask]
+_ml_dates = df.index[_ml_mask]
+
+mc_tab, garch_tab, ml_tab = st.tabs([
+    "蒙特卡洛模拟（30天·1000条路径）",
+    "GARCH 波动率预测",
+    "ML 价格预测（5日）",
+])
 
 with mc_tab:
     with st.spinner("正在运行 1000 条路径模拟..."):
@@ -1776,6 +2071,76 @@ with garch_tab:
             f"β (GARCH) = {g['beta']:.5f} &nbsp;·&nbsp; "
             f"持续性 α+β = {g['persistence']:.5f}"
             f"</div>",
+            unsafe_allow_html=True,
+        )
+
+with ml_tab:
+    with st.spinner("正在训练 Ridge + 随机森林模型..."):
+        _ml_feat_tup  = tuple(map(tuple, _ml_feat.round(8)))
+        _ml_close_tup = tuple(_ml_close.round(4))
+        _ml_dates_tup = tuple(_ml_dates.strftime("%Y-%m-%d"))
+        ml = run_ml_prediction(_ml_feat_tup, _ml_close_tup, _ml_dates_tup)
+
+    if ml.get("error") == "sklearn_missing":
+        st.error("请安装 scikit-learn：`pip install scikit-learn`")
+    elif ml.get("error") == "insufficient_data":
+        st.warning("数据不足（需 ≥ 85 行有效特征），请切换至 1y 或 2y 周期。")
+    elif ml.get("error"):
+        st.error(f"模型训练失败：{ml['error']}")
+    else:
+        # ── Metric cards ──────────────────────────────────────────────────
+        ml1, ml2, ml3, ml4 = st.columns(4)
+        _acc_color = lambda a: C["up"] if a >= 0.55 else C["warn"] if a >= 0.45 else C["down"]
+        _ml_cards = [
+            (ml1, "随机森林方向准确率", f"{ml['rf_acc']:.1%}",
+             f"测试集 {ml['n_test']} 样本", _acc_color(ml["rf_acc"])),
+            (ml2, "线性回归方向准确率", f"{ml['lr_acc']:.1%}",
+             f"训练集 {ml['n_train']} 样本", _acc_color(ml["lr_acc"])),
+            (ml3, "随机森林 MAE",  f"{ml['rf_mae']:.2f}%",
+             "5日预测绝对误差", C["accent2"]),
+            (ml4, "线性回归 MAE",  f"{ml['lr_mae']:.2f}%",
+             "5日预测绝对误差", C["dim"]),
+        ]
+        for col, lbl, val, sub, color in _ml_cards:
+            col.markdown(f"""
+            <div class='mc-card'>
+              <div class='mc-label'>{lbl}</div>
+              <div class='mc-value' style='color:{color};'>{val}</div>
+              <div class='mc-sub'>{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Forecast chart + feature importance ───────────────────────────
+        fc_col, imp_col = st.columns([3, 2])
+        with fc_col:
+            st.markdown(
+                f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
+                f"未来 {ml['horizon']} 交易日价格预测（基于技术指标特征）</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(build_ml_forecast_chart(ml, df, C), width="stretch")
+        with imp_col:
+            st.markdown(
+                f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
+                "随机森林特征重要性</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(build_ml_importance_chart(ml, C), width="stretch")
+
+        # ── OOS backtest ──────────────────────────────────────────────────
+        st.markdown(
+            f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
+            "样本外回测：预测 vs 实际 5日收益率（%）</div>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(build_ml_backtest_chart(ml, C), width="stretch")
+
+        st.markdown(
+            f"<div style='font-size:11px;color:{C['dim']};margin-top:4px;'>"
+            f"特征：RSI · MACD · 布林%B · MA20/50比值 · 1/5/20日对数收益 &nbsp;·&nbsp; "
+            f"模型：Ridge + RandomForest(100棵) &nbsp;·&nbsp; "
+            f"验证：时序80/20分割</div>",
             unsafe_allow_html=True,
         )
 
