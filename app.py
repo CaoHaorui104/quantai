@@ -117,6 +117,34 @@ h1, h2, h3 {
     white-space: pre-wrap;
 }
 
+/* Portfolio weight ticker cards */
+.po-ticker-card {
+    background: #0f1629;
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-align: center;
+    border-top: 3px solid #6366f1;
+    border-left: 1px solid #1e2d4a;
+    border-right: 1px solid #1e2d4a;
+    border-bottom: 1px solid #1e2d4a;
+}
+
+/* Monte Carlo key metric cards */
+.mc-card {
+    background: #0f1629;
+    border: 1px solid #1e2d4a;
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-align: center;
+}
+.mc-label { font-size: 11px; color: #64748b; margin-bottom: 6px; }
+.mc-value {
+    font-family: 'Space Mono', monospace;
+    font-size: 18px;
+    font-weight: 700;
+}
+.mc-sub { font-size: 10px; color: #475569; margin-top: 4px; }
+
 /* Risk assessment cards */
 .risk-card {
     background: #0f1629;
@@ -760,6 +788,324 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
     return message.content[0].text
 
 
+@st.cache_data(ttl=600)
+def run_monte_carlo(
+    last_close: float,
+    daily_mu: float,
+    daily_sigma: float,
+    n_days: int = 30,
+    n_sims: int = 1000,
+    seed: int = 42,
+) -> dict:
+    rng = np.random.default_rng(seed)
+    Z = rng.standard_normal((n_days, n_sims))
+    log_ret = (daily_mu - 0.5 * daily_sigma ** 2) + daily_sigma * Z
+    paths = np.vstack([
+        np.full(n_sims, last_close),
+        last_close * np.exp(np.cumsum(log_ret, axis=0)),
+    ])  # shape: (n_days+1, n_sims)
+
+    pcts = {p: np.percentile(paths, p, axis=1) for p in (5, 25, 50, 75, 95)}
+    final = paths[-1]
+    final_rets = (final - last_close) / last_close
+
+    buckets = [
+        ("< −15%",      final_rets < -0.15),
+        ("−15% ~ −5%",  (final_rets >= -0.15) & (final_rets < -0.05)),
+        ("−5% ~ +5%",   (final_rets >= -0.05) & (final_rets < 0.05)),
+        ("+5% ~ +15%",  (final_rets >= 0.05)  & (final_rets < 0.15)),
+        ("> +15%",      final_rets >= 0.15),
+    ]
+    probs = [(lbl, float(mask.sum() / n_sims)) for lbl, mask in buckets]
+
+    return {
+        "paths": paths,
+        "pcts": pcts,
+        "final_rets": final_rets,
+        "probs": probs,
+        "up_prob": float((final > last_close).sum() / n_sims),
+        "S0": last_close,
+        "n_days": n_days,
+        "n_sims": n_sims,
+    }
+
+
+def build_mc_chart(mc: dict, ticker: str) -> go.Figure:
+    days = np.arange(mc["n_days"] + 1)
+    S0, pcts = mc["S0"], mc["pcts"]
+
+    fig = go.Figure()
+
+    # Background paths sample (200)
+    sample = mc["paths"][:, :200]
+    for col in range(sample.shape[1]):
+        fig.add_trace(go.Scatter(
+            x=days, y=sample[:, col], mode="lines",
+            line=dict(color="rgba(99,102,241,0.035)", width=1),
+            showlegend=False, hoverinfo="skip",
+        ))
+
+    # Shaded bands
+    def _band(hi, lo, fill_color, name):
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([days, days[::-1]]),
+            y=np.concatenate([pcts[hi], pcts[lo][::-1]]),
+            fill="toself", fillcolor=fill_color,
+            line=dict(color="rgba(0,0,0,0)"),
+            name=name, hoverinfo="skip",
+        ))
+
+    _band(95, 5,  "rgba(99,102,241,0.07)",  "5–95% 区间")
+    _band(75, 25, "rgba(99,102,241,0.13)",  "25–75% 区间")
+
+    # Three key percentile lines
+    for p, color, dash, name in [
+        (5,  "#f43f5e", "dash",  "5th pct（悲观）"),
+        (50, "#a78bfa", "solid", "中位数"),
+        (95, "#10b981", "dash",  "95th pct（乐观）"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=days, y=pcts[p], name=name,
+            line=dict(color=color, width=2 if p == 50 else 1.8, dash=dash),
+        ))
+
+    fig.add_hline(
+        y=S0, line_dash="dot", line_color="#475569", opacity=0.8,
+        annotation_text=f"当前 ${S0:.2f}",
+        annotation_font_color="#64748b", annotation_font_size=11,
+    )
+
+    fig.update_layout(
+        height=340,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        xaxis=dict(title="未来天数", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a", dtick=5),
+        yaxis=dict(title="模拟价格 ($)", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
+        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+                    orientation="h", y=1.12, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def build_mc_dist_chart(mc: dict) -> go.Figure:
+    labels = [p[0] for p in mc["probs"]]
+    values = [p[1] * 100 for p in mc["probs"]]
+    colors = ["#f43f5e", "#f97316", "#64748b", "#34d399", "#10b981"]
+
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h",
+        marker_color=colors,
+        text=[f"{v:.1f}%" for v in values],
+        textposition="outside",
+        textfont=dict(family="Space Mono, monospace", size=12, color="#e2e8f0"),
+        hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
+    ))
+
+    fig.update_layout(
+        height=240,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        xaxis=dict(
+            title="概率 (%)", gridcolor="#1e2d4a", zerolinecolor="#1e2d4a",
+            range=[0, max(values) * 1.35],
+        ),
+        yaxis=dict(gridcolor="#1e2d4a", zerolinecolor="#1e2d4a"),
+        margin=dict(l=0, r=50, t=0, b=0),
+        showlegend=False,
+    )
+    return fig
+
+
+@st.cache_data(ttl=600)
+def fetch_and_optimize(tickers: tuple) -> dict:
+    """Download 2yr prices for tickers and run PyPortfolioOpt max-Sharpe optimization."""
+    try:
+        from pypfopt import EfficientFrontier, risk_models, expected_returns
+    except ImportError:
+        return {"error": "pypfopt_missing"}
+
+    try:
+        raw = yf.download(list(tickers), period="2y", progress=False, auto_adjust=True)
+    except YFRateLimitError:
+        return {"error": "rate_limit"}
+    except Exception as e:
+        return {"error": str(e)}
+
+    # Normalise columns regardless of yfinance version
+    if isinstance(raw.columns, pd.MultiIndex):
+        prices = raw["Close"].copy()
+    else:
+        prices = raw[["Close"]].copy()
+        prices.columns = [tickers[0]]
+
+    prices = prices.dropna(how="all").ffill().bfill().dropna(how="any")
+    prices = prices[[c for c in prices.columns if prices[c].notna().sum() >= 100]]
+
+    if prices.shape[1] < 2 or len(prices) < 100:
+        return {"error": "insufficient_data"}
+
+    try:
+        mu = expected_returns.mean_historical_return(prices)
+        S  = risk_models.sample_cov(prices)
+
+        # ── Max Sharpe ──────────────────────────────────────────────────────
+        ef = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+        ef.max_sharpe(risk_free_rate=0.05)
+        weights  = ef.clean_weights()
+        ret, vol, sharpe = ef.portfolio_performance(risk_free_rate=0.05, verbose=False)
+
+        # ── Min Volatility ─────────────────────────────────────────────────
+        ef2 = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+        ef2.min_volatility()
+        mv_weights = ef2.clean_weights()
+        mv_ret, mv_vol, mv_sharpe = ef2.portfolio_performance(risk_free_rate=0.05, verbose=False)
+
+        # ── Efficient frontier trace ────────────────────────────────────────
+        frontier = []
+        for target in np.linspace(float(mu.min()), float(mu.max()), 60):
+            try:
+                ef_t = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+                ef_t.efficient_return(target)
+                r, v, _ = ef_t.portfolio_performance(risk_free_rate=0.05, verbose=False)
+                frontier.append((float(v), float(r)))
+            except Exception:
+                pass
+
+        # ── Random portfolios (background scatter) ──────────────────────────
+        n = prices.shape[1]
+        rng = np.random.default_rng(42)
+        daily = prices.pct_change().dropna()
+        ann_mu  = daily.mean().values * 252
+        ann_cov = daily.cov().values * 252
+        W = rng.dirichlet(np.ones(n), size=3000)
+        r_rets  = W @ ann_mu
+        r_vols  = np.sqrt(np.einsum("ij,jk,ik->i", W, ann_cov, W))
+        r_sharpe = np.where(r_vols > 0, (r_rets - 0.05) / r_vols, 0.0)
+
+        return {
+            "weights":   dict(weights),
+            "ret": float(ret), "vol": float(vol), "sharpe": float(sharpe),
+            "mv_weights": dict(mv_weights),
+            "mv_ret": float(mv_ret), "mv_vol": float(mv_vol), "mv_sharpe": float(mv_sharpe),
+            "frontier":  frontier,
+            "rand_vols":    r_vols.tolist(),
+            "rand_rets":    r_rets.tolist(),
+            "rand_sharpes": np.nan_to_num(r_sharpe).tolist(),
+            "tickers": list(prices.columns),
+            "error": None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def build_ef_chart(result: dict) -> go.Figure:
+    fig = go.Figure()
+
+    # Random portfolio scatter (coloured by Sharpe)
+    fig.add_trace(go.Scatter(
+        x=result["rand_vols"], y=result["rand_rets"],
+        mode="markers",
+        marker=dict(
+            size=3, opacity=0.45,
+            color=result["rand_sharpes"],
+            colorscale=[[0, "#0f1629"], [0.45, "#3b4fd4"], [1, "#10b981"]],
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Sharpe", font=dict(size=11, color="#64748b")),
+                thickness=10, len=0.65,
+                tickfont=dict(size=10, color="#64748b"),
+            ),
+            cmin=float(np.percentile(result["rand_sharpes"], 5)),
+            cmax=float(np.percentile(result["rand_sharpes"], 95)),
+        ),
+        name="随机组合",
+        hovertemplate="波动率: %{x:.1%}<br>收益率: %{y:.1%}<extra></extra>",
+    ))
+
+    # Efficient frontier curve
+    if result["frontier"]:
+        ef_v = [p[0] for p in result["frontier"]]
+        ef_r = [p[1] for p in result["frontier"]]
+        fig.add_trace(go.Scatter(
+            x=ef_v, y=ef_r, mode="lines",
+            line=dict(color="#a78bfa", width=2.5),
+            name="有效前沿",
+        ))
+
+    # Min-vol portfolio
+    fig.add_trace(go.Scatter(
+        x=[result["mv_vol"]], y=[result["mv_ret"]],
+        mode="markers+text",
+        marker=dict(size=14, color="#f59e0b", symbol="diamond",
+                    line=dict(color="#0a0e1a", width=2)),
+        text=["最小波动"], textposition="top right",
+        textfont=dict(size=10, color="#f59e0b"),
+        name=f"最小波动  Sharpe {result['mv_sharpe']:.2f}",
+    ))
+
+    # Max-Sharpe portfolio
+    fig.add_trace(go.Scatter(
+        x=[result["vol"]], y=[result["ret"]],
+        mode="markers+text",
+        marker=dict(size=16, color="#10b981", symbol="star",
+                    line=dict(color="#0a0e1a", width=2)),
+        text=["最优夏普"], textposition="top right",
+        textfont=dict(size=10, color="#10b981"),
+        name=f"最优夏普  Sharpe {result['sharpe']:.2f}",
+    ))
+
+    fig.update_layout(
+        height=420,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        xaxis=dict(title="年化波动率", gridcolor="#1e2d4a",
+                   zerolinecolor="#1e2d4a", tickformat=".0%"),
+        yaxis=dict(title="年化预期收益率", gridcolor="#1e2d4a",
+                   zerolinecolor="#1e2d4a", tickformat=".0%"),
+        legend=dict(bgcolor="#0f1629", bordercolor="#1e2d4a", borderwidth=1,
+                    font=dict(size=11), x=0.01, y=0.99, xanchor="left"),
+        margin=dict(l=0, r=20, t=10, b=0),
+        hovermode="closest",
+    )
+    return fig
+
+
+def build_weight_chart(result: dict) -> go.Figure:
+    palette = ["#6366f1", "#10b981", "#f59e0b", "#f43f5e", "#a78bfa", "#34d399"]
+    items = sorted(
+        [(k, v) for k, v in result["weights"].items() if v > 0.001],
+        key=lambda x: -x[1],
+    )
+    labels = [x[0] for x in items]
+    values = [x[1] for x in items]
+
+    fig = go.Figure(go.Pie(
+        labels=labels, values=values,
+        hole=0.58,
+        marker=dict(colors=palette[:len(labels)],
+                    line=dict(color="#0a0e1a", width=3)),
+        textinfo="label+percent",
+        textfont=dict(family="Space Mono, monospace", size=12),
+        hovertemplate="%{label}: %{value:.1%}<extra></extra>",
+        direction="clockwise", sort=True,
+    ))
+    fig.update_layout(
+        height=300,
+        paper_bgcolor="#0a0e1a",
+        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=12),
+        margin=dict(l=0, r=0, t=10, b=0),
+        showlegend=False,
+        annotations=[dict(
+            text=f"Sharpe<br><b>{result['sharpe']:.2f}</b>",
+            x=0.5, y=0.5, font_size=13, showarrow=False,
+            font=dict(color="#a78bfa", family="Space Mono, monospace"),
+        )],
+    )
+    return fig
+
+
 @st.cache_data(ttl=300)
 def fetch_spy_6m() -> pd.Series:
     try:
@@ -1129,7 +1475,7 @@ st.markdown("---")
 # ── Chart ─────────────────────────────────────────────────────────────────────
 st.markdown("### 📊 技术图表")
 fig = build_chart(df, ticker)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # ── Market Comparison ────────────────────────────────────────────────────────
 st.markdown("### 📈 大盘对比（近6个月收益率）")
@@ -1137,7 +1483,7 @@ if spy_close.empty:
     st.warning("⚠️ 无法加载 SPY 数据，大盘对比图暂不可用。")
 else:
     cmp_fig = build_comparison_chart(df, spy_close, ticker)
-    st.plotly_chart(cmp_fig, use_container_width=True)
+    st.plotly_chart(cmp_fig, width="stretch")
 
 # ── Backtest ─────────────────────────────────────────────────────────────────
 st.markdown(
@@ -1198,7 +1544,7 @@ else:
 
     # ── Equity curve ──────────────────────────────────────────────────────────
     bt_fig = build_backtest_chart(bt["equity"], df, bt["trades"])
-    st.plotly_chart(bt_fig, use_container_width=True)
+    st.plotly_chart(bt_fig, width="stretch")
 
     # ── Trade log ─────────────────────────────────────────────────────────────
     with st.expander("📋 查看交易记录"):
@@ -1209,7 +1555,177 @@ else:
             lambda v: "color: #10b981" if isinstance(v, str) and v.startswith("+") else
                       ("color: #f43f5e" if isinstance(v, str) and v.startswith("-") else ""),
             subset=["收益率"]
-        ), use_container_width=True)
+        ), width="stretch")
+
+st.markdown("---")
+
+# ── Monte Carlo ───────────────────────────────────────────────────────────────
+st.markdown("### 🎲 蒙特卡洛价格路径模拟（未来30天 · 1000条路径）")
+
+_daily_ret = df["Close"].pct_change().dropna()
+_mu  = round(float(_daily_ret.mean()), 8)
+_sig = round(float(_daily_ret.std()),  8)
+
+with st.spinner("正在运行 1000 条路径模拟..."):
+    mc = run_monte_carlo(last_close, _mu, _sig)
+
+# Key metric cards
+p5_price  = mc["pcts"][5][-1]
+p50_price = mc["pcts"][50][-1]
+p95_price = mc["pcts"][95][-1]
+up_prob   = mc["up_prob"]
+
+def _mc_color(price):
+    return "#10b981" if price >= last_close else "#f43f5e"
+
+mc1, mc2, mc3, mc4 = st.columns(4)
+mc_cards = [
+    (mc1, "悲观预期（5th）",  f"${p5_price:.2f}",  f"{(p5_price-last_close)/last_close:+.1%}",  _mc_color(p5_price)),
+    (mc2, "中位数（50th）",   f"${p50_price:.2f}", f"{(p50_price-last_close)/last_close:+.1%}", _mc_color(p50_price)),
+    (mc3, "乐观预期（95th）", f"${p95_price:.2f}", f"{(p95_price-last_close)/last_close:+.1%}", _mc_color(p95_price)),
+    (mc4, "30日上涨概率",    f"{up_prob:.1%}",     f"基于 {mc['n_sims']} 次模拟",
+     "#10b981" if up_prob >= 0.5 else "#f43f5e"),
+]
+for col, lbl, val, sub, color in mc_cards:
+    col.markdown(f"""
+    <div class='mc-card'>
+      <div class='mc-label'>{lbl}</div>
+      <div class='mc-value' style='color:{color};'>{val}</div>
+      <div class='mc-sub'>{sub}</div>
+    </div>""", unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# Chart + distribution side by side
+ch_col, dist_col = st.columns([3, 2])
+with ch_col:
+    st.plotly_chart(build_mc_chart(mc, ticker), width="stretch")
+with dist_col:
+    st.markdown(
+        "<div style='font-size:12px;color:#64748b;margin-bottom:8px;'>30日后收益区间概率分布</div>",
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(build_mc_dist_chart(mc), width="stretch")
+
+st.markdown("---")
+
+# ── Portfolio Optimization ────────────────────────────────────────────────────
+st.markdown("### 📐 投资组合优化（最大化夏普比率）")
+
+_po_default = f"{ticker}, MSFT, GOOGL"
+_palette = ["#6366f1", "#10b981", "#f59e0b", "#f43f5e", "#a78bfa", "#34d399"]
+
+col_po_in, col_po_btn = st.columns([5, 1])
+with col_po_in:
+    po_raw = st.text_input(
+        "输入 2–6 只股票代码（逗号分隔，使用 2 年历史数据）",
+        value=st.session_state.get("po_input", _po_default),
+        placeholder="AAPL, MSFT, GOOGL, NVDA",
+    )
+with col_po_btn:
+    st.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
+    po_btn = st.button("🔧 开始优化", width="stretch")
+
+if po_btn:
+    _cleaned = tuple(dict.fromkeys(
+        t.strip().upper() for t in po_raw.split(",") if t.strip()
+    ))
+    if len(_cleaned) < 2:
+        st.warning("⚠️ 请至少输入 2 只股票。")
+    elif len(_cleaned) > 6:
+        st.warning("⚠️ 最多支持 6 只股票，请减少数量。")
+    else:
+        st.session_state["po_input"]  = po_raw
+        st.session_state["po_tickers"] = _cleaned
+        with st.spinner(f"正在下载 {', '.join(_cleaned)} 历史数据并计算最优权重..."):
+            st.session_state["po_result"] = fetch_and_optimize(_cleaned)
+
+if "po_result" in st.session_state:
+    _po = st.session_state["po_result"]
+    _err = _po.get("error")
+
+    if _err == "pypfopt_missing":
+        st.error("❌ 未安装 PyPortfolioOpt，请运行：`pip install PyPortfolioOpt`")
+    elif _err == "rate_limit":
+        st.error("⏱️ Yahoo Finance 频率限制，请稍后重试。")
+    elif _err == "insufficient_data":
+        st.error("❌ 历史数据不足（需 ≥ 100 个交易日），请检查股票代码。")
+    elif _err:
+        st.error(f"❌ 优化失败：{_err}")
+    else:
+        # ── Summary metric cards ──────────────────────────────────────────
+        pm1, pm2, pm3, pm4 = st.columns(4)
+        _n_active = sum(1 for v in _po["weights"].values() if v > 0.01)
+        _po_cards = [
+            (pm1, "预期年化收益",   f"{_po['ret']:+.2%}",  "最优夏普组合",   "#10b981" if _po["ret"] > 0 else "#f43f5e"),
+            (pm2, "预期年化波动率", f"{_po['vol']:.2%}",   "年化标准差",     "#f59e0b"),
+            (pm3, "预期夏普比率",   f"{_po['sharpe']:.2f}", "无风险利率 5%", "#a78bfa"),
+            (pm4, "有效配置资产",   f"{_n_active} 只",     f"共 {len(_po['tickers'])} 只输入", "#64748b"),
+        ]
+        for col, lbl, val, sub, color in _po_cards:
+            col.markdown(f"""
+            <div class='bt-card'>
+              <div class='bt-label'>{lbl}</div>
+              <div class='bt-value' style='color:{color};'>{val}</div>
+              <div class='bt-sub'>{sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Per-ticker weight cards ────────────────────────────────────────
+        _active = sorted(
+            [(k, v) for k, v in _po["weights"].items() if v > 0.001],
+            key=lambda x: -x[1],
+        )
+        _wt_cols = st.columns(max(len(_active), 1))
+        for i, (tkr, wt) in enumerate(_active):
+            _wt_cols[i].markdown(f"""
+            <div class='po-ticker-card' style='border-top-color:{_palette[i]};'>
+              <div class='bt-label'>{tkr}</div>
+              <div class='bt-value' style='color:{_palette[i]};font-size:26px;'>{wt:.1%}</div>
+              <div class='bt-sub'>建议配比</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Charts ────────────────────────────────────────────────────────
+        ef_col, wt_col = st.columns([3, 2])
+        with ef_col:
+            st.markdown(
+                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                "有效前沿（散点颜色 = 夏普比率，绿星 = 最优，黄钻 = 最小波动）</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(build_ef_chart(_po), width="stretch")
+        with wt_col:
+            st.markdown(
+                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                "最优权重分配</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(build_weight_chart(_po), width="stretch")
+
+        # ── Min-vol comparison ─────────────────────────────────────────────
+        with st.expander("📋 对比：最小波动组合"):
+            _mv_active = sorted(
+                [(k, v) for k, v in _po["mv_weights"].items() if v > 0.001],
+                key=lambda x: -x[1],
+            )
+            _mv_cols = st.columns(max(len(_mv_active), 1))
+            for i, (tkr, wt) in enumerate(_mv_active):
+                _mv_cols[i].markdown(f"""
+                <div class='po-ticker-card' style='border-top-color:{_palette[i]};'>
+                  <div class='bt-label'>{tkr}</div>
+                  <div class='bt-value' style='color:{_palette[i]};font-size:22px;'>{wt:.1%}</div>
+                  <div class='bt-sub'>最小波动配比</div>
+                </div>""", unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='font-size:12px;color:#64748b;margin-top:12px;'>"
+                f"预期收益 {_po['mv_ret']:+.2%} &nbsp;·&nbsp; "
+                f"波动率 {_po['mv_vol']:.2%} &nbsp;·&nbsp; "
+                f"夏普 {_po['mv_sharpe']:.2f}</div>",
+                unsafe_allow_html=True,
+            )
 
 st.markdown("---")
 
@@ -1325,7 +1841,7 @@ else:
 with st.expander("📋 查看原始数据"):
     show_df = df[["Open", "High", "Low", "Close", "Volume", "MA20", "MA50", "RSI", "MACD"]].tail(30)
     show_df = show_df.round(3)
-    st.dataframe(show_df, use_container_width=True)
+    st.dataframe(show_df, width="stretch")
 
 st.markdown("""
 <div style='text-align:center; padding:32px 0 16px; color:#334155; font-size:12px;'>
