@@ -909,6 +909,94 @@ def build_garch_forecast_chart(g: dict, C: dict) -> go.Figure:
     return fig
 
 
+@st.cache_data(ttl=3600)
+def fetch_fear_greed() -> dict:
+    _zh = {
+        "Extreme Fear":  "极度恐惧",
+        "Fear":          "恐惧",
+        "Neutral":       "中性",
+        "Greed":         "贪婪",
+        "Extreme Greed": "极度贪婪",
+    }
+    url = "https://api.alternative.me/fng/"
+    try:
+        import requests as _req
+        resp = _req.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        raw = resp.json()["data"][0]
+        val = int(raw["value"])
+        cls = raw.get("value_classification", "")
+        return {"value": val, "label_en": cls, "label_zh": _zh.get(cls, cls), "error": None}
+    except Exception as e:
+        return {"value": None, "label_en": None, "label_zh": "N/A", "error": str(e)}
+
+
+def build_fg_gauge(fg: dict, C: dict) -> go.Figure:
+    val = fg["value"] if fg["value"] is not None else 50
+    label_zh = fg["label_zh"]
+
+    if fg["value"] is None or val <= 25:
+        bar_color = "#f43f5e"
+    elif val <= 45:
+        bar_color = "#f59e0b"
+    elif val <= 55:
+        bar_color = "#4a5568"
+    elif val <= 75:
+        bar_color = "#10b981"
+    else:
+        bar_color = "#10b981"
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=val,
+        domain={"x": [0, 1], "y": [0, 1]},
+        number={
+            "font": {"size": 30, "color": bar_color, "family": "Space Mono, monospace"},
+            "suffix": "",
+        },
+        gauge={
+            "axis": {
+                "range": [0, 100],
+                "tickvals": [0, 25, 50, 75, 100],
+                "ticktext": ["0", "25", "50", "75", "100"],
+                "tickfont": {"size": 9, "color": "#475569"},
+                "tickwidth": 1,
+                "tickcolor": "#1e2d4a",
+            },
+            "bar": {"color": bar_color, "thickness": 0.22},
+            "bgcolor": "rgba(0,0,0,0)",
+            "borderwidth": 0,
+            "steps": [
+                {"range": [0,   25],  "color": "rgba(244,63,94,0.12)"},
+                {"range": [25,  45],  "color": "rgba(245,158,11,0.12)"},
+                {"range": [45,  55],  "color": "rgba(74,85,104,0.10)"},
+                {"range": [55,  75],  "color": "rgba(16,185,129,0.12)"},
+                {"range": [75, 100],  "color": "rgba(16,185,129,0.25)"},
+            ],
+            "threshold": {
+                "line": {"color": bar_color, "width": 3},
+                "thickness": 0.85,
+                "value": val,
+            },
+        },
+    ))
+    fig.update_layout(
+        height=170,
+        paper_bgcolor=C["bg"],
+        plot_bgcolor=C["bg"],
+        font=dict(family="DM Sans, sans-serif", color="#64748b", size=11),
+        margin=dict(l=8, r=8, t=28, b=0),
+        annotations=[dict(
+            text=label_zh,
+            x=0.5, y=0.20,
+            xref="paper", yref="paper",
+            showarrow=False,
+            font=dict(size=12, color=bar_color, family="DM Sans, sans-serif"),
+        )],
+    )
+    return fig
+
+
 @st.cache_data(ttl=600)
 def run_monte_carlo(
     last_close: float,
@@ -1937,8 +2025,9 @@ for col, lbl, val, badge, color in risk_cards:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Signal ────────────────────────────────────────────────────────────────────
+# ── Signal + Fear & Greed ─────────────────────────────────────────────────────
 signal, reasons = get_signal(df)
+fg = fetch_fear_greed()
 
 signal_styles = {
     "BUY":  ("signal-buy",  "BUY · 买入",  C["up"]),
@@ -1947,7 +2036,7 @@ signal_styles = {
 }
 css_class, label, color = signal_styles[signal]
 
-col_sig, col_reasons = st.columns([1, 2])
+col_sig, col_reasons, col_fg = st.columns([1, 2, 1])
 with col_sig:
     st.markdown(f"""
     <div class='{css_class}'>
@@ -1960,6 +2049,23 @@ with col_reasons:
     st.markdown("**信号依据**")
     for r in reasons:
         st.markdown(f"- {r}")
+
+with col_fg:
+    _fg_src = "N/A" if fg["error"] else "alternative.me"
+    _fg_muted = C["muted"]
+    _fg_dim = C["dim"]
+    st.markdown(
+        f"<div style='font-size:11px;color:{_fg_muted};margin-bottom:2px;'>"
+        f"市场恐慌贪婪指数 &nbsp;<span style='color:{_fg_dim};font-size:10px;'>{_fg_src}</span></div>",
+        unsafe_allow_html=True,
+    )
+    if fg["value"] is None:
+        st.markdown(
+            f"<div style='font-size:28px;font-weight:700;color:{_fg_muted};padding:32px 0;text-align:center;'>N/A</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.plotly_chart(build_fg_gauge(fg, C), width="stretch")
 
 st.markdown("---")
 
