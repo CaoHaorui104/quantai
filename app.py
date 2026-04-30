@@ -1490,13 +1490,11 @@ def build_ml_forecast_chart(ml: dict, df: pd.DataFrame, C: dict) -> go.Figure:
         line=dict(color=C["accent"], width=2),
     ))
 
-    # Next N trading days (skip weekends)
+    # Next N trading days via business-day range (consistent Timestamp type)
     last_date = df.index[-1]
-    future_dates, d = [], last_date
-    while len(future_dates) < ml["horizon"]:
-        d = d + pd.Timedelta(days=1)
-        if d.weekday() < 5:
-            future_dates.append(d)
+    future_dates = list(
+        pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=ml["horizon"])
+    )
 
     # Connect today → prediction
     cx = [last_date] + future_dates
@@ -1536,11 +1534,15 @@ def build_ml_forecast_chart(ml: dict, df: pd.DataFrame, C: dict) -> go.Figure:
                     line=dict(color=C["bg"], width=2)),
     ))
 
-    fig.add_vline(
-        x=last_date, line_dash="dot", line_color=C["dim"], opacity=0.7,
-        annotation_text="今日", annotation_font_color=C["muted"],
-        annotation_font_size=10,
-    )
+    all_prices = recent.tolist() + ml["rf_upper"] + ml["rf_lower"]
+    _ymin = min(all_prices) * 0.995
+    _ymax = max(all_prices) * 1.005
+    fig.add_trace(go.Scatter(
+        x=[last_date, last_date], y=[_ymin, _ymax],
+        mode="lines",
+        line=dict(color=C["dim"], width=1, dash="dot"),
+        showlegend=False, hoverinfo="skip",
+    ))
 
     fig.update_layout(
         height=360,
