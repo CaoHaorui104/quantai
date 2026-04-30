@@ -620,6 +620,80 @@ def fetch_ticker_info(ticker: str) -> dict:
     return yf.Ticker(ticker).info or {}
 
 
+@st.cache_data(ttl=600)
+def fetch_earnings_and_insider(ticker: str) -> dict:
+    try:
+        t = yf.Ticker(ticker)
+
+        # ── Earnings ──────────────────────────────────────────────────────
+        cal = t.calendar or {}
+        raw_dates = cal.get("Earnings Date", [])
+        next_date = raw_dates[0] if raw_dates else None
+
+        def _fmt_money(v):
+            if v is None:
+                return "N/A"
+            v = float(v)
+            return f"${v/1e9:.2f}B" if abs(v) >= 1e9 else f"${v/1e6:.1f}M"
+
+        earnings = {
+            "next_date":  str(next_date) if next_date else None,
+            "eps_avg":    cal.get("Earnings Average"),
+            "eps_high":   cal.get("Earnings High"),
+            "eps_low":    cal.get("Earnings Low"),
+            "rev_avg":    _fmt_money(cal.get("Revenue Average")),
+            "rev_high":   _fmt_money(cal.get("Revenue High")),
+            "rev_low":    _fmt_money(cal.get("Revenue Low")),
+        }
+
+        # Days until next earnings
+        if next_date:
+            try:
+                delta = (pd.Timestamp(next_date) - pd.Timestamp("today")).days
+                earnings["days_until"] = int(delta)
+            except Exception:
+                earnings["days_until"] = None
+        else:
+            earnings["days_until"] = None
+
+        # ── Insider transactions ──────────────────────────────────────────
+        def _tx_type(text: str) -> str:
+            if not isinstance(text, str) or not text.strip():
+                return "其他"
+            t_low = text.lower()
+            if "sale" in t_low:
+                return "卖出"
+            if "purchase" in t_low or "buy" in t_low or "acquisition" in t_low:
+                return "买入"
+            if "gift" in t_low:
+                return "赠予"
+            return "其他"
+
+        insider_rows = []
+        try:
+            it = t.insider_transactions
+            if it is not None and not it.empty:
+                for _, row in it.head(10).iterrows():
+                    val = row.get("Value")
+                    val_str = (f"${float(val)/1e6:.2f}M"
+                               if pd.notna(val) and float(val) > 0 else "—")
+                    shares = int(row.get("Shares", 0))
+                    insider_rows.append({
+                        "日期":    str(row.get("Start Date", ""))[:10],
+                        "内部人":  str(row.get("Insider", "")).title(),
+                        "职位":    str(row.get("Position", "")),
+                        "类型":    _tx_type(str(row.get("Text", ""))),
+                        "股数":    f"{shares:,}",
+                        "交易额":  val_str,
+                    })
+        except Exception:
+            pass
+
+        return {"earnings": earnings, "insider": insider_rows, "error": None}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @st.cache_data(ttl=300)
 def fetch_news(ticker: str) -> list[dict]:
     try:
@@ -1905,6 +1979,90 @@ with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=
                     f"夏普 {_po['mv_sharpe']:.2f}</div>",
                     unsafe_allow_html=True,
                 )
+
+st.markdown("---")
+
+# ── Earnings & Insider Trading ────────────────────────────────────────────────
+st.markdown("### 📅 财报 & 内部人交易")
+
+with st.spinner("获取财报和内部人数据..."):
+    ei = fetch_earnings_and_insider(ticker)
+
+if ei.get("error"):
+    st.warning(f"⚠️ 数据获取失败：{ei['error']}")
+else:
+    earn = ei["earnings"]
+    earn_col, insider_col = st.columns([1, 2])
+
+    with earn_col:
+        # Next earnings date
+        if earn["next_date"]:
+            days = earn["days_until"]
+            days_str = (f"还有 {days} 天" if days is not None and days >= 0
+                        else ("已过" if days is not None else ""))
+            date_color = ("#f59e0b" if days is not None and days <= 30
+                          else "#e2e8f0")
+            st.markdown(f"""
+            <div class='bt-card' style='text-align:left;padding:18px 20px;'>
+              <div style='font-size:11px;color:#64748b;margin-bottom:6px;'>下次财报日期</div>
+              <div style='font-family:Space Mono,monospace;font-size:22px;
+                          font-weight:700;color:{date_color};'>{earn["next_date"]}</div>
+              <div style='font-size:12px;color:#f59e0b;margin-top:4px;'>{days_str}</div>
+              <hr style='border-color:#1e2d4a;margin:12px 0;'>
+              <div style='font-size:11px;color:#64748b;margin-bottom:4px;'>EPS 预期</div>
+              <div style='font-family:Space Mono,monospace;font-size:18px;
+                          font-weight:700;color:#a78bfa;'>
+                {"${:.2f}".format(float(earn["eps_avg"])) if earn["eps_avg"] is not None else "N/A"}
+              </div>
+              <div style='font-size:11px;color:#475569;margin-top:2px;'>
+                低 {"${:.2f}".format(float(earn["eps_low"])) if earn["eps_low"] is not None else "—"}
+                &nbsp;·&nbsp;
+                高 {"${:.2f}".format(float(earn["eps_high"])) if earn["eps_high"] is not None else "—"}
+              </div>
+              <hr style='border-color:#1e2d4a;margin:12px 0;'>
+              <div style='font-size:11px;color:#64748b;margin-bottom:4px;'>营收预期</div>
+              <div style='font-family:Space Mono,monospace;font-size:16px;
+                          font-weight:700;color:#e2e8f0;'>{earn["rev_avg"]}</div>
+              <div style='font-size:11px;color:#475569;margin-top:2px;'>
+                低 {earn["rev_low"]} &nbsp;·&nbsp; 高 {earn["rev_high"]}
+              </div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.info("暂无财报日期数据。")
+
+    with insider_col:
+        if ei["insider"]:
+            insider_df = pd.DataFrame(ei["insider"])
+
+            def _style_row(row):
+                if row["类型"] == "买入":
+                    bg = "background-color:rgba(16,185,129,0.10)"
+                elif row["类型"] == "卖出":
+                    bg = "background-color:rgba(244,63,94,0.08)"
+                else:
+                    bg = ""
+                return [bg] * len(row)
+
+            def _style_type(val):
+                if val == "买入":
+                    return "color:#10b981;font-weight:600"
+                if val == "卖出":
+                    return "color:#f43f5e;font-weight:600"
+                return "color:#64748b"
+
+            styled = (
+                insider_df.style
+                .apply(_style_row, axis=1)
+                .map(_style_type, subset=["类型"])
+            )
+            st.markdown(
+                "<div style='font-size:12px;color:#64748b;margin-bottom:6px;'>"
+                "最近 10 条内部人交易记录</div>",
+                unsafe_allow_html=True,
+            )
+            st.dataframe(styled, width="stretch", hide_index=True)
+        else:
+            st.info("暂无内部人交易记录。")
 
 st.markdown("---")
 
