@@ -1618,122 +1618,119 @@ with dist_col:
 st.markdown("---")
 
 # ── Portfolio Optimization ────────────────────────────────────────────────────
-st.markdown("### 📐 投资组合优化（最大化夏普比率）")
-
-_po_default = f"{ticker}, MSFT, GOOGL"
 _palette = ["#6366f1", "#10b981", "#f59e0b", "#f43f5e", "#a78bfa", "#34d399"]
 
-col_po_in, col_po_btn = st.columns([5, 1])
-with col_po_in:
-    po_raw = st.text_input(
-        "输入 2–6 只股票代码（逗号分隔，使用 2 年历史数据）",
-        value=st.session_state.get("po_input", _po_default),
-        placeholder="AAPL, MSFT, GOOGL, NVDA",
-    )
-with col_po_btn:
-    st.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
-    po_btn = st.button("🔧 开始优化", width="stretch")
+with st.expander("📐 投资组合优化（最大化夏普比率）", expanded=True):
 
-if po_btn:
-    _cleaned = tuple(dict.fromkeys(
-        t.strip().upper() for t in po_raw.split(",") if t.strip()
-    ))
-    if len(_cleaned) < 2:
-        st.warning("⚠️ 请至少输入 2 只股票。")
-    elif len(_cleaned) > 6:
-        st.warning("⚠️ 最多支持 6 只股票，请减少数量。")
-    else:
-        st.session_state["po_input"]  = po_raw
-        st.session_state["po_tickers"] = _cleaned
-        with st.spinner(f"正在下载 {', '.join(_cleaned)} 历史数据并计算最优权重..."):
-            st.session_state["po_result"] = fetch_and_optimize(_cleaned)
-
-if "po_result" in st.session_state:
-    _po = st.session_state["po_result"]
-    _err = _po.get("error")
-
-    if _err == "pypfopt_missing":
-        st.error("❌ 未安装 PyPortfolioOpt，请运行：`pip install PyPortfolioOpt`")
-    elif _err == "rate_limit":
-        st.error("⏱️ Yahoo Finance 频率限制，请稍后重试。")
-    elif _err == "insufficient_data":
-        st.error("❌ 历史数据不足（需 ≥ 100 个交易日），请检查股票代码。")
-    elif _err:
-        st.error(f"❌ 优化失败：{_err}")
-    else:
-        # ── Summary metric cards ──────────────────────────────────────────
-        pm1, pm2, pm3, pm4 = st.columns(4)
-        _n_active = sum(1 for v in _po["weights"].values() if v > 0.01)
-        _po_cards = [
-            (pm1, "预期年化收益",   f"{_po['ret']:+.2%}",  "最优夏普组合",   "#10b981" if _po["ret"] > 0 else "#f43f5e"),
-            (pm2, "预期年化波动率", f"{_po['vol']:.2%}",   "年化标准差",     "#f59e0b"),
-            (pm3, "预期夏普比率",   f"{_po['sharpe']:.2f}", "无风险利率 5%", "#a78bfa"),
-            (pm4, "有效配置资产",   f"{_n_active} 只",     f"共 {len(_po['tickers'])} 只输入", "#64748b"),
-        ]
-        for col, lbl, val, sub, color in _po_cards:
-            col.markdown(f"""
-            <div class='bt-card'>
-              <div class='bt-label'>{lbl}</div>
-              <div class='bt-value' style='color:{color};'>{val}</div>
-              <div class='bt-sub'>{sub}</div>
-            </div>""", unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── Per-ticker weight cards ────────────────────────────────────────
-        _active = sorted(
-            [(k, v) for k, v in _po["weights"].items() if v > 0.001],
-            key=lambda x: -x[1],
+    # st.form batches all widget changes; only the submit button triggers a rerun,
+    # so this section never resets the rest of the page.
+    with st.form("portfolio_form"):
+        po_raw = st.text_input(
+            "输入 2–6 只股票代码（逗号分隔，使用 2 年历史数据）",
+            value=st.session_state.get("po_input", f"{ticker}, MSFT, GOOGL"),
+            placeholder="AAPL, MSFT, GOOGL, NVDA",
         )
-        _wt_cols = st.columns(max(len(_active), 1))
-        for i, (tkr, wt) in enumerate(_active):
-            _wt_cols[i].markdown(f"""
-            <div class='po-ticker-card' style='border-top-color:{_palette[i]};'>
-              <div class='bt-label'>{tkr}</div>
-              <div class='bt-value' style='color:{_palette[i]};font-size:26px;'>{wt:.1%}</div>
-              <div class='bt-sub'>建议配比</div>
-            </div>""", unsafe_allow_html=True)
+        po_submitted = st.form_submit_button("🔧 开始优化", width="stretch")
 
-        st.markdown("<br>", unsafe_allow_html=True)
+    if po_submitted:
+        _cleaned = tuple(dict.fromkeys(
+            t.strip().upper() for t in po_raw.split(",") if t.strip()
+        ))
+        if len(_cleaned) < 2:
+            st.warning("⚠️ 请至少输入 2 只股票。")
+        elif len(_cleaned) > 6:
+            st.warning("⚠️ 最多支持 6 只股票，请减少数量。")
+        else:
+            st.session_state["po_input"] = po_raw
+            with st.spinner(f"正在下载 {', '.join(_cleaned)} 历史数据并计算最优权重..."):
+                st.session_state["po_result"] = fetch_and_optimize(_cleaned)
 
-        # ── Charts ────────────────────────────────────────────────────────
-        ef_col, wt_col = st.columns([3, 2])
-        with ef_col:
-            st.markdown(
-                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
-                "有效前沿（散点颜色 = 夏普比率，绿星 = 最优，黄钻 = 最小波动）</div>",
-                unsafe_allow_html=True,
-            )
-            st.plotly_chart(build_ef_chart(_po), width="stretch")
-        with wt_col:
-            st.markdown(
-                "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
-                "最优权重分配</div>",
-                unsafe_allow_html=True,
-            )
-            st.plotly_chart(build_weight_chart(_po), width="stretch")
+    if "po_result" in st.session_state:
+        _po = st.session_state["po_result"]
+        _err = _po.get("error")
 
-        # ── Min-vol comparison ─────────────────────────────────────────────
-        with st.expander("📋 对比：最小波动组合"):
-            _mv_active = sorted(
-                [(k, v) for k, v in _po["mv_weights"].items() if v > 0.001],
+        if _err == "pypfopt_missing":
+            st.error("❌ 未安装 PyPortfolioOpt，请运行：`pip install PyPortfolioOpt`")
+        elif _err == "rate_limit":
+            st.error("⏱️ Yahoo Finance 频率限制，请稍后重试。")
+        elif _err == "insufficient_data":
+            st.error("❌ 历史数据不足（需 ≥ 100 个交易日），请检查股票代码。")
+        elif _err:
+            st.error(f"❌ 优化失败：{_err}")
+        else:
+            # ── Summary metric cards ──────────────────────────────────────
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            _n_active = sum(1 for v in _po["weights"].values() if v > 0.01)
+            _po_cards = [
+                (pm1, "预期年化收益",   f"{_po['ret']:+.2%}",   "最优夏普组合",   "#10b981" if _po["ret"] > 0 else "#f43f5e"),
+                (pm2, "预期年化波动率", f"{_po['vol']:.2%}",    "年化标准差",     "#f59e0b"),
+                (pm3, "预期夏普比率",   f"{_po['sharpe']:.2f}", "无风险利率 5%",  "#a78bfa"),
+                (pm4, "有效配置资产",   f"{_n_active} 只",      f"共 {len(_po['tickers'])} 只输入", "#64748b"),
+            ]
+            for col, lbl, val, sub, color in _po_cards:
+                col.markdown(f"""
+                <div class='bt-card'>
+                  <div class='bt-label'>{lbl}</div>
+                  <div class='bt-value' style='color:{color};'>{val}</div>
+                  <div class='bt-sub'>{sub}</div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Per-ticker weight cards ────────────────────────────────────
+            _active = sorted(
+                [(k, v) for k, v in _po["weights"].items() if v > 0.001],
                 key=lambda x: -x[1],
             )
-            _mv_cols = st.columns(max(len(_mv_active), 1))
-            for i, (tkr, wt) in enumerate(_mv_active):
-                _mv_cols[i].markdown(f"""
+            _wt_cols = st.columns(max(len(_active), 1))
+            for i, (tkr, wt) in enumerate(_active):
+                _wt_cols[i].markdown(f"""
                 <div class='po-ticker-card' style='border-top-color:{_palette[i]};'>
                   <div class='bt-label'>{tkr}</div>
-                  <div class='bt-value' style='color:{_palette[i]};font-size:22px;'>{wt:.1%}</div>
-                  <div class='bt-sub'>最小波动配比</div>
+                  <div class='bt-value' style='color:{_palette[i]};font-size:26px;'>{wt:.1%}</div>
+                  <div class='bt-sub'>建议配比</div>
                 </div>""", unsafe_allow_html=True)
-            st.markdown(
-                f"<div style='font-size:12px;color:#64748b;margin-top:12px;'>"
-                f"预期收益 {_po['mv_ret']:+.2%} &nbsp;·&nbsp; "
-                f"波动率 {_po['mv_vol']:.2%} &nbsp;·&nbsp; "
-                f"夏普 {_po['mv_sharpe']:.2f}</div>",
-                unsafe_allow_html=True,
-            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Charts ────────────────────────────────────────────────────
+            ef_col, wt_col = st.columns([3, 2])
+            with ef_col:
+                st.markdown(
+                    "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                    "有效前沿（散点颜色 = 夏普比率，绿星 = 最优，黄钻 = 最小波动）</div>",
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(build_ef_chart(_po), width="stretch")
+            with wt_col:
+                st.markdown(
+                    "<div style='font-size:12px;color:#64748b;margin-bottom:4px;'>"
+                    "最优权重分配</div>",
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(build_weight_chart(_po), width="stretch")
+
+            # ── Min-vol comparison ─────────────────────────────────────────
+            with st.expander("📋 对比：最小波动组合"):
+                _mv_active = sorted(
+                    [(k, v) for k, v in _po["mv_weights"].items() if v > 0.001],
+                    key=lambda x: -x[1],
+                )
+                _mv_cols = st.columns(max(len(_mv_active), 1))
+                for i, (tkr, wt) in enumerate(_mv_active):
+                    _mv_cols[i].markdown(f"""
+                    <div class='po-ticker-card' style='border-top-color:{_palette[i]};'>
+                      <div class='bt-label'>{tkr}</div>
+                      <div class='bt-value' style='color:{_palette[i]};font-size:22px;'>{wt:.1%}</div>
+                      <div class='bt-sub'>最小波动配比</div>
+                    </div>""", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div style='font-size:12px;color:#64748b;margin-top:12px;'>"
+                    f"预期收益 {_po['mv_ret']:+.2%} &nbsp;·&nbsp; "
+                    f"波动率 {_po['mv_vol']:.2%} &nbsp;·&nbsp; "
+                    f"夏普 {_po['mv_sharpe']:.2f}</div>",
+                    unsafe_allow_html=True,
+                )
 
 st.markdown("---")
 
