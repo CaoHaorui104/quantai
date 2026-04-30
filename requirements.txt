@@ -6,3 +6,5 @@ plotly
 anthropic
 PyPortfolioOpt
 arch
+xgboost
+lightgbm
