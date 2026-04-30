@@ -616,6 +616,11 @@ def fetch_data(ticker: str, period: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def fetch_ticker_info(ticker: str) -> dict:
+    return yf.Ticker(ticker).info or {}
+
+
+@st.cache_data(ttl=300)
 def fetch_news(ticker: str) -> list[dict]:
     try:
         raw = yf.Ticker(ticker).news or []
@@ -1298,7 +1303,10 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if not run_btn:
+if run_btn:
+    st.session_state["analysis_active"] = True
+
+if not st.session_state.get("analysis_active"):
     st.markdown("""
     <div style='text-align:center; padding:80px 0; color:#4a5568;'>
       <div style='font-size:48px; margin-bottom:16px;'>🔍</div>
@@ -1324,7 +1332,7 @@ if df.empty:
     st.stop()
 
 try:
-    info = yf.Ticker(ticker).info
+    info = fetch_ticker_info(ticker)
     if not info:
         raise ValueError("empty response")
 except YFRateLimitError:
