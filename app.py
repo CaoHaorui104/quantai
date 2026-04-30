@@ -1069,13 +1069,16 @@ def fetch_and_optimize(tickers: tuple) -> dict:
         S  = risk_models.sample_cov(prices)
 
         # ── Max Sharpe ──────────────────────────────────────────────────────
-        ef = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+        _n_assets = len(tickers)
+        _w_bounds = (max(0.05, 1.0 / _n_assets * 0.5), 0.60)
+
+        ef = EfficientFrontier(mu, S, weight_bounds=_w_bounds)
         ef.max_sharpe(risk_free_rate=0.05)
         weights  = ef.clean_weights()
         ret, vol, sharpe = ef.portfolio_performance(risk_free_rate=0.05, verbose=False)
 
         # ── Min Volatility ─────────────────────────────────────────────────
-        ef2 = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+        ef2 = EfficientFrontier(mu, S, weight_bounds=_w_bounds)
         ef2.min_volatility()
         mv_weights = ef2.clean_weights()
         mv_ret, mv_vol, mv_sharpe = ef2.portfolio_performance(risk_free_rate=0.05, verbose=False)
@@ -1084,7 +1087,7 @@ def fetch_and_optimize(tickers: tuple) -> dict:
         frontier = []
         for target in np.linspace(float(mu.min()), float(mu.max()), 60):
             try:
-                ef_t = EfficientFrontier(mu, S, weight_bounds=(0, 1))
+                ef_t = EfficientFrontier(mu, S, weight_bounds=_w_bounds)
                 ef_t.efficient_return(target)
                 r, v, _ = ef_t.portfolio_performance(risk_free_rate=0.05, verbose=False)
                 frontier.append((float(v), float(r)))
@@ -1410,26 +1413,31 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         _df = lambda arr: pd.DataFrame(arr, columns=_cols)
 
         # ── Hyperparameter tuning (inner CV, 3 folds) ────────────────────────
+        # Each fold gets its own scaler fitted only on that fold's train split
+        # to prevent mean/std statistics from leaking across fold boundaries.
         inner_cv = TimeSeriesSplit(n_splits=3)
-        scaler_tune = StandardScaler()
-        X_s = scaler_tune.fit_transform(X_v)
         rng = np.random.default_rng(42)
 
-        def _cv_dir_acc(estimator, Xs, ys, cv, as_df=False):
+        def _cv_dir_acc(estimator, X_raw, ys, cv, as_df=False):
             scores = []
-            for tr, te in cv.split(Xs):
-                Xtr_ = _df(Xs[tr]) if as_df else Xs[tr]
-                Xte_ = _df(Xs[te]) if as_df else Xs[te]
+            for tr, te in cv.split(X_raw):
+                if len(tr) < 20:
+                    continue
+                sc = StandardScaler()
+                Xtr_s = sc.fit_transform(X_raw[tr])
+                Xte_s = sc.transform(X_raw[te])
+                Xtr_ = _df(Xtr_s) if as_df else Xtr_s
+                Xte_ = _df(Xte_s) if as_df else Xte_s
                 estimator.fit(Xtr_, ys[tr])
                 scores.append(float(np.mean(
                     np.sign(estimator.predict(Xte_)) == np.sign(ys[te])
                 )))
-            return float(np.mean(scores))
+            return float(np.mean(scores)) if scores else 0.5
 
         # Ridge alpha search
         best_ridge_alpha = max(
             [0.01, 0.1, 1.0, 10.0, 100.0],
-            key=lambda a: _cv_dir_acc(Ridge(alpha=a), X_s, y5, inner_cv),
+            key=lambda a: _cv_dir_acc(Ridge(alpha=a), X_v, y5, inner_cv),
         )
 
         # RF grid (2 × 2)
@@ -1440,7 +1448,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                 p = {"n_estimators": n_est, "max_depth": depth, "min_samples_leaf": 4}
                 s = _cv_dir_acc(
                     RandomForestRegressor(**p, random_state=42, n_jobs=1),
-                    X_s, y5, inner_cv,
+                    X_v, y5, inner_cv,
                 )
                 if s > best_rf_score:
                     best_rf_score, best_rf_p = s, p
@@ -1459,7 +1467,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             p = {k: v[int(rng.integers(len(v)))] for k, v in _xgb_space.items()}
             s = _cv_dir_acc(
                 xgb.XGBRegressor(**p, random_state=42, verbosity=0, n_jobs=1),
-                X_s, y5, inner_cv,
+                X_v, y5, inner_cv,
             )
             if s > best_xgb_score:
                 best_xgb_score, best_xgb_p = s, p
@@ -1476,7 +1484,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             p = {k: v[int(rng.integers(len(v)))] for k, v in _lgb_space.items()}
             s = _cv_dir_acc(
                 lgb.LGBMRegressor(**p, random_state=42, verbose=-1, n_jobs=1),
-                X_s, y5, inner_cv, as_df=True,
+                X_v, y5, inner_cv, as_df=True,
             )
             if s > best_lgb_score:
                 best_lgb_score, best_lgb_p = s, p
@@ -1487,7 +1495,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                      ["Ridge", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]}
 
         for fold_tr, fold_te in tscv.split(X_v):
-            if len(fold_tr) < 50 or len(fold_te) < 5:
+            if len(fold_tr) < 30 or len(fold_te) < 30:
                 continue
             sc = StandardScaler()
             Xtr = sc.fit_transform(X_v[fold_tr])
@@ -2078,15 +2086,19 @@ _macd_h_chg = np.full(_n_ml, np.nan); _macd_h_chg[1:] = _macd_h_arr[1:] - _macd_
 _bb_width = np.where(_bb_u_arr - _bb_l_arr > 0, _bb_u_arr - _bb_l_arr, 1.0)
 _bb_pctb  = (_close_arr - _bb_l_arr) / _bb_width
 
-# ATR (14-day rolling mean of true range)
-_tr = np.maximum(_high_arr - _low_arr,
-      np.maximum(np.abs(_high_arr - np.roll(_close_arr, 1)),
-                 np.abs(_low_arr  - np.roll(_close_arr, 1))))
-_tr[0] = _high_arr[0] - _low_arr[0]
-_atr14 = np.full(_n_ml, np.nan)
+# ATR_ratio: 14-day rolling mean of (TR / Close), fully dimensionless
+_prev_close = np.roll(_close_arr, 1)
+_prev_close[0] = _close_arr[0]
+_tr_ratio = np.maximum(
+    (_high_arr - _low_arr) / np.where(_close_arr > 0, _close_arr, 1.0),
+    np.maximum(
+        np.abs(_high_arr - _prev_close) / np.where(_close_arr > 0, _close_arr, 1.0),
+        np.abs(_low_arr  - _prev_close) / np.where(_close_arr > 0, _close_arr, 1.0),
+    )
+)
+_atr_n = np.full(_n_ml, np.nan)
 for _i in range(13, _n_ml):
-    _atr14[_i] = _tr[_i - 13: _i + 1].mean()
-_atr_n = np.where(_close_arr > 0, _atr14 / _close_arr, np.nan)
+    _atr_n[_i] = _tr_ratio[_i - 13: _i + 1].mean()
 
 # MA deviation (%, not ratio)
 _ma20_dev = np.where(_close_arr > 0, (_close_arr - _ma20_arr) / _close_arr, np.nan)
