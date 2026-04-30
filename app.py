@@ -541,6 +541,36 @@ def fetch_data(ticker: str, period: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def scan_ticker(tkr: str) -> dict:
+    try:
+        df = yf.download(tkr, period="3mo", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 30:
+            return {"ticker": tkr, "error": "no_data"}
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df["MA20"] = df["Close"].rolling(20).mean()
+        df["MA50"]  = df["Close"].rolling(50).mean()
+        df["RSI"]   = compute_rsi(df["Close"])
+        df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = compute_macd(df["Close"])
+        df["BB_Upper"], df["BB_Mid"], df["BB_Lower"]   = compute_bollinger(df["Close"])
+        df = df.dropna(subset=["RSI", "MACD", "BB_Upper"])
+        if len(df) < 2:
+            return {"ticker": tkr, "error": "no_data"}
+        sig, _ = get_signal(df)
+        price = float(df["Close"].iloc[-1])
+        chg   = (price - float(df["Close"].iloc[-2])) / float(df["Close"].iloc[-2]) * 100
+        rsi   = float(df["RSI"].iloc[-1])
+        return {
+            "ticker": tkr, "price": price, "signal": sig,
+            "rsi": rsi, "chg_pct": chg,
+            "sort_key": {"BUY": 0, "HOLD": 1, "SELL": 2}[sig],
+            "error": None,
+        }
+    except Exception as e:
+        return {"ticker": tkr, "error": str(e)}
+
+
+@st.cache_data(ttl=300)
 def fetch_ticker_info(ticker: str) -> dict:
     return yf.Ticker(ticker).info or {}
 
@@ -1335,9 +1365,10 @@ def compute_risk_metrics(df: pd.DataFrame, spy_close: pd.Series, beta_from_info:
         corr = None
 
     if not spy_close.empty:
-        spy_daily = spy_close.pct_change().dropna()
-        aligned = pd.concat([daily, spy_daily], axis=1, join="inner")
-        aligned.columns = ["stock", "spy"]
+        _stock_s = (daily.iloc[:, 0] if isinstance(daily, pd.DataFrame) else daily).rename("stock")
+        _spy_s   = spy_close.pct_change().dropna()
+        _spy_s   = (_spy_s.iloc[:, 0] if isinstance(_spy_s, pd.DataFrame) else _spy_s).rename("spy")
+        aligned  = pd.concat([_stock_s, _spy_s], axis=1, join="inner")
         if len(aligned) >= 20:
             corr = float(aligned.corr().iloc[0, 1])
             if beta is None:
@@ -1854,6 +1885,81 @@ with st.sidebar:
         if cols[i % 2].button(q, key=f"q_{q}"):
             ticker = q
             run_btn = True
+
+    st.markdown("---")
+    st.markdown("### 多股票扫描")
+    with st.form("scanner_form"):
+        _scan_input = st.text_input(
+            "最多10只股票（逗号分隔）",
+            placeholder="AAPL, TSLA, NVDA, MSFT",
+            value="AAPL, TSLA, NVDA, MSFT",
+        )
+        _scan_btn = st.form_submit_button("扫描信号", use_container_width=True)
+
+    if _scan_btn:
+        _scan_tickers = list(dict.fromkeys(
+            t.strip().upper() for t in _scan_input.split(",") if t.strip()
+        ))[:10]
+        with st.spinner(f"扫描 {len(_scan_tickers)} 只股票..."):
+            _scan_raw = [scan_ticker(t) for t in _scan_tickers]
+        _scan_raw.sort(key=lambda r: (r.get("sort_key", 1), r.get("ticker", "")))
+        st.session_state["scan_results"] = _scan_raw
+
+    if "scan_results" in st.session_state:
+        _rows = st.session_state["scan_results"]
+        _sig_color = {"BUY": "#10b981", "HOLD": "#f59e0b", "SELL": "#f43f5e"}
+        _sig_zh    = {"BUY": "买入", "HOLD": "观望", "SELL": "卖出"}
+
+        _header = (
+            "<table style='width:100%;border-collapse:collapse;"
+            "font-size:11px;font-family:DM Sans,sans-serif;'>"
+            "<thead><tr>"
+            "<th style='text-align:left;padding:3px 4px;color:#64748b;font-weight:500;'>代码</th>"
+            "<th style='text-align:right;padding:3px 4px;color:#64748b;font-weight:500;'>价格</th>"
+            "<th style='text-align:center;padding:3px 4px;color:#64748b;font-weight:500;'>信号</th>"
+            "<th style='text-align:right;padding:3px 4px;color:#64748b;font-weight:500;'>RSI</th>"
+            "<th style='text-align:right;padding:3px 4px;color:#64748b;font-weight:500;'>涨跌</th>"
+            "</tr></thead><tbody>"
+        )
+        _body = ""
+        for _r in _rows:
+            if _r.get("error"):
+                _body += (
+                    f"<tr><td style='padding:3px 4px;color:#64748b;' colspan='5'>"
+                    f"{_r['ticker']} — 数据获取失败</td></tr>"
+                )
+                continue
+            _sc  = _sig_color.get(_r["signal"], "#64748b")
+            _sz  = _sig_zh.get(_r["signal"], _r["signal"])
+            _chg = _r["chg_pct"]
+            _cc  = "#10b981" if _chg >= 0 else "#f43f5e"
+            _rsi_c = "#f43f5e" if _r["rsi"] > 70 else "#10b981" if _r["rsi"] < 35 else "#94a3b8"
+            _body += (
+                f"<tr style='border-top:1px solid #1e2d4a;'>"
+                f"<td style='padding:4px 4px;font-weight:600;color:#e2e8f0;"
+                f"font-family:Space Mono,monospace;'>{_r['ticker']}</td>"
+                f"<td style='padding:4px 4px;text-align:right;color:#e2e8f0;"
+                f"font-family:Space Mono,monospace;'>${_r['price']:.2f}</td>"
+                f"<td style='padding:4px 4px;text-align:center;'>"
+                f"<span style='background:{_sc}22;color:{_sc};border-radius:4px;"
+                f"padding:1px 6px;font-weight:600;font-size:10px;'>{_sz}</span></td>"
+                f"<td style='padding:4px 4px;text-align:right;color:{_rsi_c};"
+                f"font-family:Space Mono,monospace;'>{_r['rsi']:.1f}</td>"
+                f"<td style='padding:4px 4px;text-align:right;color:{_cc};"
+                f"font-family:Space Mono,monospace;'>{_chg:+.2f}%</td>"
+                f"</tr>"
+            )
+        st.markdown(_header + _body + "</tbody></table>", unsafe_allow_html=True)
+        _n_buy  = sum(1 for r in _rows if r.get("signal") == "BUY")
+        _n_sell = sum(1 for r in _rows if r.get("signal") == "SELL")
+        st.markdown(
+            f"<div style='font-size:10px;color:#64748b;margin-top:6px;'>"
+            f"买入 <span style='color:#10b981;font-weight:600;'>{_n_buy}</span> &nbsp;·&nbsp; "
+            f"卖出 <span style='color:#f43f5e;font-weight:600;'>{_n_sell}</span> &nbsp;·&nbsp; "
+            f"观望 <span style='color:#f59e0b;font-weight:600;'>{len(_rows)-_n_buy-_n_sell}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("---")
     st.markdown("""
