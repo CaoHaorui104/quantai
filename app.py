@@ -273,8 +273,48 @@ def compute_bollinger(series: pd.Series, window: int = 20):
     return ma + 2 * std, ma, ma - 2 * std
 
 
-def compute_signal_scores(df: pd.DataFrame) -> pd.Series:
-    """Vectorized signal score for every row in df (requires pre-computed indicators)."""
+def compute_regime(df: pd.DataFrame) -> dict:
+    """
+    Classify market state per bar using MA50 10-day normalised slope.
+
+    slope[i] = (MA50[i] - MA50[i-10]) / MA50[i-10] / 10   (fractional per-day)
+    epsilon   = daily_return_std * 0.1
+
+    slope >  epsilon  → UPTREND
+    slope < -epsilon  → DOWNTREND
+    otherwise         → RANGE
+    """
+    daily_std = float(df["Close"].pct_change().std())
+    epsilon   = daily_std * 0.1
+
+    ma50  = df["MA50"]
+    slope = ma50.pct_change(periods=10) / 10          # fractional per-day rate
+
+    regimes = pd.Series("RANGE", index=df.index, dtype=object)
+    valid = slope.notna()
+    regimes[valid & (slope >  epsilon)] = "UPTREND"
+    regimes[valid & (slope < -epsilon)] = "DOWNTREND"
+
+    cur_slope  = float(slope.iloc[-1]) if pd.notna(slope.iloc[-1]) else 0.0
+    cur_regime = str(regimes.iloc[-1])
+    strength   = abs(cur_slope) / epsilon if epsilon > 0 else 0.0
+
+    return {
+        "regimes":       regimes,
+        "slopes":        slope,
+        "current":       cur_regime,
+        "current_slope": cur_slope,
+        "epsilon":       epsilon,
+        "strength":      strength,
+    }
+
+
+def compute_signal_scores(df: pd.DataFrame, regime_info: dict | None = None) -> pd.Series:
+    """Signal score per bar, regime-aware: RSI oversold suppressed in DOWNTREND."""
+    if regime_info is None:
+        regime_info = compute_regime(df)
+    regimes = regime_info["regimes"]
+
     scores = pd.Series(0.0, index=df.index)
     for i in range(1, len(df)):
         last = df.iloc[i]
@@ -282,11 +322,15 @@ def compute_signal_scores(df: pd.DataFrame) -> pd.Series:
         if pd.isna(last["RSI"]) or pd.isna(last["MACD"]) or pd.isna(last["BB_Upper"]):
             continue
         s = 0
-        rsi = last["RSI"]
-        if rsi < 35:
+        rsi    = last["RSI"]
+        regime = regimes.iloc[i]
+
+        # RSI — oversold BUY signal blocked in DOWNTREND
+        if rsi < 35 and regime != "DOWNTREND":
             s += 2
         elif rsi > 70:
             s -= 2
+
         if last["MACD"] > last["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
             s += 2
         elif last["MACD"] < last["MACD_Signal"] and prev["MACD"] >= prev["MACD_Signal"]:
@@ -318,21 +362,37 @@ def run_backtest(
     Exit priority: stop-loss → take-profit → sell signal → max holding days.
     Slippage and commission are applied on both entry and exit legs.
     """
-    scores = compute_signal_scores(df)
-    closes = df["Close"].values
-    dates = df.index
-    n = len(df)
+    regime_info = compute_regime(df)
+    scores  = compute_signal_scores(df, regime_info=regime_info)
+    regimes = regime_info["regimes"]
+    closes  = df["Close"].values
+    dates   = df.index
+    n       = len(df)
 
-    trades = []
-    in_trade = False
+    trades    = []
+    in_trade  = False
     entry_idx = entry_price = None
 
     # Round-trip cost: buy slippage + sell slippage + 2 × commission
-    cost = 2 * slippage + 2 * commission
+    cost      = 2 * slippage + 2 * commission
+    cooldown  = 0           # bars remaining after DOWNTREND exit
+    prev_reg  = str(regimes.iloc[0])
 
     for i in range(1, n - 1):
+        cur_reg = str(regimes.iloc[i])
+
+        # Start 2-bar cooldown the moment we leave DOWNTREND
+        if prev_reg == "DOWNTREND" and cur_reg != "DOWNTREND":
+            cooldown = 2
+        prev_reg = cur_reg
+
         if not in_trade:
-            if scores.iloc[i] >= 2:
+            if cooldown > 0:
+                cooldown -= 1
+                continue
+            # UPTREND requires stronger confirmation (score >= 3)
+            entry_threshold = 3 if cur_reg == "UPTREND" else 2
+            if scores.iloc[i] >= entry_threshold:
                 entry_idx = i + 1
                 entry_price = float(closes[entry_idx]) * (1 + slippage + commission)
                 in_trade = True
@@ -472,19 +532,30 @@ def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.Data
     return fig
 
 
-def get_signal(df: pd.DataFrame) -> tuple[str, list[str]]:
-    """Simple rule-based signal generator."""
-    reasons = []
-    score = 0
+def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
+    """Regime-filtered rule-based signal generator.
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    Regime rules applied to the latest bar:
+      DOWNTREND  – RSI oversold does NOT trigger +2 (suppressed)
+      UPTREND    – BUY requires score >= 3 (stricter threshold)
+      RANGE      – normal behaviour
+    """
+    regime_info = compute_regime(df)
+    regime      = regime_info["current"]
+
+    reasons = []
+    score   = 0
+    last    = df.iloc[-1]
+    prev    = df.iloc[-2]
 
     # RSI
     rsi = last["RSI"]
     if rsi < 35:
-        score += 2
-        reasons.append(f"RSI={rsi:.1f} → 超卖区间，有反弹预期")
+        if regime == "DOWNTREND":
+            reasons.append(f"RSI={rsi:.1f} → 超卖，但趋势向下，买入信号被抑制")
+        else:
+            score += 2
+            reasons.append(f"RSI={rsi:.1f} → 超卖区间，有反弹预期")
     elif rsi > 70:
         score -= 2
         reasons.append(f"RSI={rsi:.1f} → 超买区间，存在回调风险")
@@ -516,12 +587,15 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str]]:
         score -= 1
         reasons.append("价格突破布林带上轨 → 短期超买")
 
-    if score >= 2:
-        return "BUY", reasons
+    # Regime-adjusted BUY threshold
+    buy_threshold = 3 if regime == "UPTREND" else 2
+
+    if score >= buy_threshold:
+        return "BUY", reasons, regime_info
     elif score <= -2:
-        return "SELL", reasons
+        return "SELL", reasons, regime_info
     else:
-        return "HOLD", reasons
+        return "HOLD", reasons, regime_info
 
 
 @st.cache_data(ttl=300)
@@ -556,7 +630,7 @@ def scan_ticker(tkr: str) -> dict:
         df = df.dropna(subset=["RSI", "MACD", "BB_Upper"])
         if len(df) < 2:
             return {"ticker": tkr, "error": "no_data"}
-        sig, _ = get_signal(df)
+        sig, _, _ri = get_signal(df)
         price = float(df["Close"].iloc[-1])
         chg   = (price - float(df["Close"].iloc[-2])) / float(df["Close"].iloc[-2]) * 100
         rsi   = float(df["RSI"].iloc[-1])
@@ -2136,7 +2210,7 @@ for col, lbl, val, badge, color in risk_cards:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Signal + Fear & Greed ─────────────────────────────────────────────────────
-signal, reasons = get_signal(df)
+signal, reasons, regime_info = get_signal(df)
 fg = fetch_fear_greed()
 
 signal_styles = {
@@ -2146,12 +2220,30 @@ signal_styles = {
 }
 css_class, label, color = signal_styles[signal]
 
+# Regime display helpers
+_regime_zh  = {"UPTREND": "上升趋势", "DOWNTREND": "下降趋势", "RANGE": "震荡区间"}
+_regime_col = {"UPTREND": C["up"],    "DOWNTREND": C["down"],  "RANGE": C["muted"]}
+_cur_regime = regime_info["current"]
+_rc         = _regime_col[_cur_regime]
+_rz         = _regime_zh[_cur_regime]
+_slope_pct  = regime_info["current_slope"] * 100          # convert to % per day
+_strength   = regime_info["strength"]
+_str_zh     = "强" if _strength > 3 else "中" if _strength > 1.5 else "弱"
+
 col_sig, col_reasons, col_fg = st.columns([1, 2, 1])
 with col_sig:
     st.markdown(f"""
     <div class='{css_class}'>
       <div style='font-size:22px; font-weight:700; color:{color};'>{label}</div>
       <div style='font-size:11px; color:{C["muted"]}; margin-top:6px;'>综合技术信号</div>
+    </div>
+    <div style='margin-top:10px; padding:8px 10px; background:{_rc}12;
+                border:1px solid {_rc}40; border-radius:8px;'>
+      <div style='font-size:12px; font-weight:600; color:{_rc};'>{_rz}</div>
+      <div style='font-size:10px; color:{C["dim"]}; margin-top:3px;'>
+        MA50斜率 <span style='font-family:Space Mono,monospace;color:{_rc};'>{_slope_pct:+.3f}%/日</span>
+        &nbsp;·&nbsp; 趋势强度 <span style='color:{_rc};'>{_str_zh}</span>
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2228,18 +2320,39 @@ else:
             return "#10b981" if val >= 0 else "#f43f5e"
         return "#f43f5e" if val >= 0 else "#10b981"
 
+    # SPY annualised Sharpe over the same date window as df
+    _spy_sharpe = None
+    if not spy_close.empty:
+        _spy_aligned = spy_close.reindex(df.index, method="ffill").dropna()
+        if len(_spy_aligned) > 5:
+            _spy_dr = _spy_aligned.pct_change().dropna()
+            _spy_std = float(_spy_dr.std())
+            if _spy_std > 0:
+                _spy_sharpe = float(_spy_dr.mean() / _spy_std * np.sqrt(252))
+
     wr_color = "#10b981" if m["win_rate"] >= 0.5 else "#f43f5e"
     tr_color = _color(m["total_return"])
     dd_color = "#f43f5e" if m["max_drawdown"] < -0.1 else "#f59e0b" if m["max_drawdown"] < -0.05 else "#10b981"
-    sh_color = "#10b981" if m["sharpe"] >= 1 else "#f59e0b" if m["sharpe"] >= 0 else "#f43f5e"
     bh_color = _color(m["bh_return"])
+
+    _sh_beats_spy = _spy_sharpe is not None and m["sharpe"] > _spy_sharpe
+    sh_color = (
+        "#10b981" if _sh_beats_spy
+        else "#f59e0b" if m["sharpe"] >= 0
+        else "#f43f5e"
+    )
+    _sh_sub = (
+        f"SPY同期 {_spy_sharpe:.2f}  ·  持均 {m['avg_hold_days']:.1f}日"
+        if _spy_sharpe is not None
+        else f"年化，持均 {m['avg_hold_days']:.1f}日"
+    )
 
     c1, c2, c3, c4, c5 = st.columns(5)
     cards = [
         (c1, "胜率", f"{m['win_rate']:.1%}", f"{m['total_trades']} 笔交易", wr_color),
         (c2, "总收益率", f"{m['total_return']:+.2%}", f"买入持有 {m['bh_return']:+.2%}", tr_color),
         (c3, "最大回撤", f"{m['max_drawdown']:.2%}", "策略期间峰谷跌幅", dd_color),
-        (c4, "夏普比率", f"{m['sharpe']:.2f}", f"年化，持均 {m['avg_hold_days']:.1f}日", sh_color),
+        (c4, "夏普比率", f"{m['sharpe']:.2f}", _sh_sub, sh_color),
         (c5, "平均单笔", f"{m['avg_return']:+.2%}", "每笔交易平均收益", _color(m["avg_return"])),
     ]
     for col, label, val, sub, color in cards:
