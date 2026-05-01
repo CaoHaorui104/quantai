@@ -692,7 +692,7 @@ REASON: <15字以内的一句话理由>"""
 
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-3-5-haiku-20241022",
         max_tokens=80,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -815,7 +815,7 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
 
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -2006,6 +2006,10 @@ except Exception as e:
 
 if df.empty:
     st.error(f"❌ 找不到股票代码 **{ticker}**，请检查拼写后重试。")
+    st.stop()
+
+if len(df) < 20:
+    st.error(f"❌ **{ticker}** 数据不足（仅 {len(df)} 行），请切换至更长的回看周期（建议 3mo 或以上）。")
     st.stop()
 
 try:
