@@ -390,8 +390,11 @@ def run_backtest(
             if cooldown > 0:
                 cooldown -= 1
                 continue
-            # UPTREND requires stronger confirmation (score >= 3)
-            entry_threshold = 3 if cur_reg == "UPTREND" else 2
+            # DOWNTREND: no entries at all
+            if cur_reg == "DOWNTREND":
+                continue
+            # UPTREND: go with trend (score >= 2.0); RANGE: standard (score >= 2.5)
+            entry_threshold = 2.0 if cur_reg == "UPTREND" else 2.5
             if scores.iloc[i] >= entry_threshold:
                 entry_idx = i + 1
                 entry_price = float(closes[entry_idx]) * (1 + slippage + commission)
@@ -535,10 +538,11 @@ def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.Data
 def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
-    Regime rules applied to the latest bar:
-      DOWNTREND  – RSI oversold does NOT trigger +2 (suppressed)
-      UPTREND    – BUY requires score >= 3 (stricter threshold)
-      RANGE      – normal behaviour
+    Threshold table (weighted_score = float(raw_score)):
+      UPTREND   – BUY if weighted_score >= 2.0  (go with trend, lower bar)
+      RANGE     – BUY if weighted_score >= 2.5  (standard, requires 3 pts)
+      DOWNTREND – BUY blocked entirely
+    SELL always triggers at raw_score <= -2 regardless of regime.
     """
     regime_info = compute_regime(df)
     regime      = regime_info["current"]
@@ -587,10 +591,21 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
         score -= 1
         reasons.append("价格突破布林带上轨 → 短期超买")
 
-    # Regime-adjusted BUY threshold
-    buy_threshold = 3 if regime == "UPTREND" else 2
+    # Regime-adjusted thresholds
+    raw_score      = score
+    weighted_score = float(score)
+    if regime == "UPTREND":
+        buy_threshold = 2.0
+    elif regime == "RANGE":
+        buy_threshold = 2.5
+    else:                       # DOWNTREND — BUY completely forbidden
+        buy_threshold = None
 
-    if score >= buy_threshold:
+    regime_info["raw_score"]      = raw_score
+    regime_info["weighted_score"] = weighted_score
+    regime_info["buy_threshold"]  = buy_threshold
+
+    if buy_threshold is not None and weighted_score >= buy_threshold:
         return "BUY", reasons, regime_info
     elif score <= -2:
         return "SELL", reasons, regime_info
@@ -2226,9 +2241,14 @@ _regime_col = {"UPTREND": C["up"],    "DOWNTREND": C["down"],  "RANGE": C["muted
 _cur_regime = regime_info["current"]
 _rc         = _regime_col[_cur_regime]
 _rz         = _regime_zh[_cur_regime]
-_slope_pct  = regime_info["current_slope"] * 100          # convert to % per day
+_slope_pct  = regime_info["current_slope"] * 100
 _strength   = regime_info["strength"]
 _str_zh     = "强" if _strength > 3 else "中" if _strength > 1.5 else "弱"
+_raw_score  = regime_info["raw_score"]
+_w_score    = regime_info["weighted_score"]
+_threshold  = regime_info["buy_threshold"]
+_thr_txt    = "禁止买入" if _threshold is None else f"{_threshold:.1f}"
+_score_col  = C["up"] if _w_score >= (_threshold or 999) else C["warn"] if _w_score > 0 else C["down"]
 
 col_sig, col_reasons, col_fg = st.columns([1, 2, 1])
 with col_sig:
@@ -2242,7 +2262,21 @@ with col_sig:
       <div style='font-size:12px; font-weight:600; color:{_rc};'>{_rz}</div>
       <div style='font-size:10px; color:{C["dim"]}; margin-top:3px;'>
         MA50斜率 <span style='font-family:Space Mono,monospace;color:{_rc};'>{_slope_pct:+.3f}%/日</span>
-        &nbsp;·&nbsp; 趋势强度 <span style='color:{_rc};'>{_str_zh}</span>
+        &nbsp;·&nbsp; 强度 <span style='color:{_rc};'>{_str_zh}</span>
+      </div>
+      <div style='margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;'>
+        <span style='font-size:10px; color:{C["dim"]};'>原始分
+          <span style='font-family:Space Mono,monospace; color:{_score_col};
+                       font-weight:600;'>{_raw_score:+d}</span>
+        </span>
+        <span style='font-size:10px; color:{C["dim"]};'>加权分
+          <span style='font-family:Space Mono,monospace; color:{_score_col};
+                       font-weight:600;'>{_w_score:+.1f}</span>
+        </span>
+        <span style='font-size:10px; color:{C["dim"]};'>触发线
+          <span style='font-family:Space Mono,monospace; color:{C["accent2"]};
+                       font-weight:600;'>{_thr_txt}</span>
+        </span>
       </div>
     </div>
     """, unsafe_allow_html=True)
