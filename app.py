@@ -299,6 +299,21 @@ def compute_regime(df: pd.DataFrame) -> dict:
     cur_regime = str(regimes.iloc[-1])
     strength   = abs(cur_slope) / epsilon if epsilon > 0 else 0.0
 
+    # ── Volatility filter ────────────────────────────────────────────────────
+    # True Range per bar, normalised by close to make it comparable across prices
+    prev_close = df["Close"].shift(1).fillna(df["Close"])
+    tr = pd.concat([
+        (df["High"] - df["Low"]),
+        (df["High"] - prev_close).abs(),
+        (df["Low"]  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14      = tr.rolling(14, min_periods=1).mean()
+    atr20_mean = atr14.rolling(20, min_periods=1).mean()
+    vol_filter = atr14 > 2.0 * atr20_mean   # True = spike, block BUY
+
+    cur_atr      = float(atr14.iloc[-1])
+    cur_atr_mean = float(atr20_mean.iloc[-1])
+
     return {
         "regimes":       regimes,
         "slopes":        slope,
@@ -306,6 +321,9 @@ def compute_regime(df: pd.DataFrame) -> dict:
         "current_slope": cur_slope,
         "epsilon":       epsilon,
         "strength":      strength,
+        "vol_filter":    vol_filter,
+        "cur_atr":       cur_atr,
+        "cur_atr_mean":  cur_atr_mean,
     }
 
 
@@ -392,6 +410,9 @@ def run_backtest(
                 continue
             # DOWNTREND: no entries at all
             if cur_reg == "DOWNTREND":
+                continue
+            # Volatility spike: ATR > 2× 20-day mean ATR blocks entry
+            if regime_info["vol_filter"].iloc[i]:
                 continue
             # UPTREND: go with trend (score >= 2.0); RANGE: standard (score >= 2.5)
             entry_threshold = 2.0 if cur_reg == "UPTREND" else 2.5
@@ -599,6 +620,14 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
     elif regime == "RANGE":
         buy_threshold = 2.5
     else:                       # DOWNTREND — BUY completely forbidden
+        buy_threshold = None
+
+    # Volatility filter — overrides buy_threshold regardless of regime
+    if regime_info["vol_filter"].iloc[-1]:
+        _atr_ratio = regime_info["cur_atr"] / max(regime_info["cur_atr_mean"], 1e-9)
+        reasons.append(
+            f"波动率过高（ATR {_atr_ratio:.1f}×均值），暂停买入"
+        )
         buy_threshold = None
 
     regime_info["raw_score"]      = raw_score
@@ -1953,7 +1982,7 @@ def build_ml_backtest_chart(ml: dict, C: dict) -> go.Figure:
 with st.sidebar:
     st.markdown("### 参数配置")
     ticker = st.text_input("股票代码", value="AAPL", placeholder="AAPL / TSLA / NVDA").upper().strip()
-    period = st.selectbox("回看周期", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+    period = st.selectbox("回看周期", ["1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "7y", "10y", "max"], index=2)
     api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
 
     st.markdown("---")
