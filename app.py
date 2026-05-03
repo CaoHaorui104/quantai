@@ -377,7 +377,8 @@ def run_backtest(
     """
     Simulate the signal strategy on historical data.
     Entry on BUY (score >= 2) at next-day close.
-    Exit priority: stop-loss → take-profit → sell signal → max holding days.
+    Exit priority: stop-loss → take-profit → 时间止损 → sell signal → max holding days.
+      时间止损: hold >= 5 bars AND pnl < +0.5% (stagnant trade cut to free capital).
     Slippage and commission are applied on both entry and exit legs.
     """
     regime_info = compute_regime(df)
@@ -428,6 +429,9 @@ def run_backtest(
                 reason = f"止损 -{stop_loss:.0%}"
             elif pnl >= take_profit:
                 reason = f"止盈 +{take_profit:.0%}"
+            elif hold >= 5 and pnl < 0.005:
+                # 时间止损：持仓≥5日且浮盈<0.5%，强制平仓释放资金
+                reason = "时间止损"
             elif scores.iloc[i] <= -2:
                 reason = "信号卖出"
             elif hold >= holding_days:
@@ -435,8 +439,8 @@ def run_backtest(
             else:
                 continue
 
-            # SL/TP triggers on current bar close; signal exits on next-day close
-            if reason.startswith("止"):
+            # SL/TP/时间止损 triggers on current bar close; signal exits on next-day close
+            if reason.startswith("止") or reason == "时间止损":
                 exit_idx = i
                 exit_price = float(closes[i]) * (1 - slippage - commission)
             else:
@@ -1814,10 +1818,21 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         oos["Ensemble"] = [(a + b + c + d) / 4
                            for a, b, c, d in zip(*oos.values())]
 
+        # 预期5日收益率（各模型及集成）
+        ens_return_pct  = float(ens_mean[-1] * 100)
+        model_return_pcts = {
+            "Ridge":        float(lr_mean[-1] * 100),
+            "RandomForest": float(rf_mean[-1] * 100),
+            "XGBoost":      float(xgb_mean[-1] * 100),
+            "LightGBM":     float(lgb_mean[-1] * 100),
+        }
+
         return {
             "ens_prices": ens_prices, "lr_prices":  lr_prices,
             "rf_upper":   rf_upper,   "rf_lower":   rf_lower,
             "cur_close":  cur_close,
+            "ens_return_pct":    ens_return_pct,
+            "model_return_pcts": model_return_pcts,
             "model_avg_acc":  model_avg_acc,
             "model_fold_accs": {k: v for k, v in fold_accs.items()},
             "best_params": {"ridge_alpha": best_ridge_alpha,
@@ -2436,11 +2451,28 @@ else:
         tdf = bt["trades"].copy()
         tdf["return"] = tdf["return"].map(lambda x: f"{x:+.2%}")
         tdf.columns = ["买入日期", "卖出日期", "买入价", "卖出价", "收益率", "持仓天数", "退出原因"]
-        st.dataframe(tdf.style.map(
-            lambda v: "color: #10b981" if isinstance(v, str) and v.startswith("+") else
-                      ("color: #f43f5e" if isinstance(v, str) and v.startswith("-") else ""),
-            subset=["收益率"]
-        ), width="stretch")
+
+        def _reason_style(v):
+            if not isinstance(v, str):
+                return ""
+            if v == "时间止损":
+                return "color:#f59e0b;font-weight:600"   # 琥珀色：时间止损
+            if v.startswith("止损"):
+                return "color:#f43f5e;font-weight:600"   # 红色：止损
+            if v.startswith("止盈"):
+                return "color:#10b981;font-weight:600"   # 绿色：止盈
+            return ""
+
+        st.dataframe(
+            tdf.style
+               .map(
+                   lambda v: "color:#10b981" if isinstance(v, str) and v.startswith("+") else
+                             ("color:#f43f5e" if isinstance(v, str) and v.startswith("-") else ""),
+                   subset=["收益率"],
+               )
+               .map(_reason_style, subset=["退出原因"]),
+            width="stretch",
+        )
 
 st.markdown("---")
 
@@ -2529,6 +2561,19 @@ _ml_feat = np.column_stack([
     _ret1, _ret3, _ret5, _ret10, _ret20,
     _vol_chg1, _vol_chg5, _vwap_dev,
 ])
+
+# Rolling Z-score normalization (window=20, min 5 obs) — removes non-stationarity
+_zwin = 20
+_ml_feat_df_z = pd.DataFrame(_ml_feat)
+_roll_mean_z  = _ml_feat_df_z.rolling(_zwin, min_periods=5).mean().values
+_roll_std_z   = _ml_feat_df_z.rolling(_zwin, min_periods=5).std().values
+_roll_std_z   = np.where(_roll_std_z < 1e-9, np.nan, _roll_std_z)
+_ml_feat = np.where(
+    np.isnan(_ml_feat) | np.isnan(_roll_mean_z) | np.isnan(_roll_std_z),
+    np.nan,
+    (_ml_feat - _roll_mean_z) / _roll_std_z,
+)
+
 _ml_mask  = ~np.any(np.isnan(_ml_feat) | np.isinf(_ml_feat), axis=1)
 _ml_feat  = _ml_feat[_ml_mask]
 _ml_close = _close_arr[_ml_mask]
@@ -2656,23 +2701,30 @@ with ml_tab:
     elif ml.get("error"):
         st.error(f"模型训练失败：{ml['error']}")
     else:
-        # ── Summary metric cards (ensemble + best single) ─────────────────
+        # ── Summary metric cards (return forecast + accuracy reference) ──────
         _acc_color = lambda a: C["up"] if a >= 0.55 else C["warn"] if a >= 0.45 else C["down"]
+        _ret_color = lambda r: C["up"] if r >= 0 else C["down"]
         _avg = ml["model_avg_acc"]
         _ens_acc = _avg.get("Ensemble", 0.0)
-        _best_name = max((k for k in _avg if k != "Ensemble"), key=lambda k: _avg[k])
-        _best_acc  = _avg[_best_name]
+        _ens_ret = ml.get("ens_return_pct", 0.0)
+        _model_rets = ml.get("model_return_pcts", {})
+        _best_ret_name = max(_model_rets, key=lambda k: abs(_model_rets[k])) if _model_rets else "Ridge"
+        _best_ret_val  = _model_rets.get(_best_ret_name, 0.0)
 
         ml1, ml2, ml3, ml4 = st.columns(4)
         _ml_cards = [
-            (ml1, "集成模型准确率", f"{_ens_acc:.1%}",
+            (ml1, "预期5日收益率",
+             f"{_ens_ret:+.2f}%",
+             f"集成模型（4模型均值）", _ret_color(_ens_ret)),
+            (ml2, f"最大分歧模型 ({_best_ret_name})",
+             f"{_best_ret_val:+.2f}%",
+             "单模型预测5日收益率", _ret_color(_best_ret_val)),
+            (ml3, "方向准确率（参考）",
+             f"{_ens_acc:.1%}",
              f"Walk-Forward {ml['n_splits']} 折均值", _acc_color(_ens_acc)),
-            (ml2, f"最佳单模型 ({_best_name})", f"{_best_acc:.1%}",
-             "方向预测准确率", _acc_color(_best_acc)),
-            (ml3, "有效样本数", f"{ml['n_total']}",
-             f"特征维度 {len(ml['feat_importance'])}", C["accent2"]),
-            (ml4, "预测期", f"{ml['horizon']} 交易日",
-             "集成 4 模型投票", C["muted"]),
+            (ml4, "有效样本 / 特征",
+             f"{ml['n_total']} / {len(ml['feat_importance'])}",
+             f"预测期 {ml['horizon']} 交易日", C["accent2"]),
         ]
         for col, lbl, val, sub, color in _ml_cards:
             col.markdown(f"""
@@ -2684,12 +2736,19 @@ with ml_tab:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Model accuracy comparison table ───────────────────────────────
+        # ── Model return forecast + accuracy comparison table ─────────────
         _fold_data = ml["model_fold_accs"]
         _table_rows = []
         for _mname in ["Ridge", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]:
             _folds = _fold_data.get(_mname, [])
-            _row = {"模型": _mname, "平均准确率": f"{_avg.get(_mname, 0):.1%}"}
+            _ret_val = (ml.get("ens_return_pct", 0.0)
+                        if _mname == "Ensemble"
+                        else _model_rets.get(_mname, 0.0))
+            _row = {
+                "模型":           _mname,
+                "预期5日收益率":  f"{_ret_val:+.2f}%",
+                "方向准确率（参考）": f"{_avg.get(_mname, 0):.1%}",
+            }
             for _fi, _fv in enumerate(_folds):
                 _row[f"Fold {_fi+1}"] = f"{_fv:.1%}"
             _table_rows.append(_row)
@@ -2697,19 +2756,27 @@ with ml_tab:
 
         st.markdown(
             f"<div style='font-size:12px;color:{C['muted']};margin-bottom:6px;'>"
-            "各模型 Walk-Forward 准确率对比（方向预测）</div>",
+            "各模型预期5日收益率 · Walk-Forward 方向准确率（参考）</div>",
             unsafe_allow_html=True,
         )
-        st.dataframe(
-            _acc_df.style.map(
-                lambda v: (
-                    f"color:{C['up']};font-weight:600" if isinstance(v, str) and v.endswith("%") and float(v[:-1]) >= 55
-                    else f"color:{C['down']}" if isinstance(v, str) and v.endswith("%") and float(v[:-1]) < 45
-                    else ""
-                )
-            ),
-            width="stretch",
-        )
+
+        def _style_cell(v):
+            if not isinstance(v, str):
+                return ""
+            if v.endswith("%"):
+                try:
+                    num = float(v.rstrip("%").replace("+", ""))
+                    if v.startswith("+") or ("+" in v and v.index("+") == 0):
+                        # return % column
+                        return f"color:{C['up']};font-weight:600" if num > 0 else f"color:{C['down']};font-weight:600"
+                    # accuracy column
+                    return (f"color:{C['up']};font-weight:600" if num >= 55
+                            else f"color:{C['down']}" if num < 45 else "")
+                except ValueError:
+                    return ""
+            return ""
+
+        st.dataframe(_acc_df.style.map(_style_cell), width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -2740,10 +2807,10 @@ with ml_tab:
 
         st.markdown(
             f"<div style='font-size:11px;color:{C['dim']};margin-top:4px;'>"
-            f"特征（17维）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
+            f"目标：未来5日收益率（回归） &nbsp;·&nbsp; "
+            f"特征（17维·滚动Z分标准化）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
             f"模型：Ridge + RandomForest + XGBoost + LightGBM &nbsp;·&nbsp; "
-            f"验证：Walk-Forward {ml['n_splits']} 折交叉验证 &nbsp;·&nbsp; "
-            f"超参数：自动调优（内层 3 折）</div>",
+            f"验证：Walk-Forward {ml['n_splits']} 折 &nbsp;·&nbsp; 超参数：自动调优（内层 3 折）</div>",
             unsafe_allow_html=True,
         )
 
