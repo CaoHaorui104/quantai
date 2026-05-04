@@ -501,6 +501,13 @@ def run_backtest(
     periods_per_year = 252 / max(avg_hold, 1)
     sharpe = float((rets.mean() / rets.std() * np.sqrt(periods_per_year)) if rets.std() > 0 else 0.0)
 
+    # Downside deviation: annualised std of negative per-trade returns only
+    neg_rets = rets[rets < 0]
+    downside_dev = (
+        float(neg_rets.std() * np.sqrt(periods_per_year))
+        if len(neg_rets) > 1 else 0.0
+    )
+
     metrics = {
         "total_trades": len(trades),
         "win_rate": win_rate,
@@ -508,6 +515,7 @@ def run_backtest(
         "bh_return": bh_return,
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
+        "downside_dev": downside_dev,
         "avg_return": float(rets.mean()),
         "avg_hold_days": avg_hold,
     }
@@ -2398,15 +2406,38 @@ else:
             return "#10b981" if val >= 0 else "#f43f5e"
         return "#f43f5e" if val >= 0 else "#10b981"
 
-    # SPY annualised Sharpe over the same date window as df
-    _spy_sharpe = None
+    # SPY metrics over the same date window as df
+    _spy_sharpe       = None
+    _spy_total_return = None
+    _excess_return    = None
+    _info_ratio       = None
     if not spy_close.empty:
         _spy_aligned = spy_close.reindex(df.index, method="ffill").dropna()
         if len(_spy_aligned) > 5:
-            _spy_dr = _spy_aligned.pct_change().dropna()
+            # Annualised Sharpe
+            _spy_dr  = _spy_aligned.pct_change().dropna()
             _spy_std = float(_spy_dr.std())
             if _spy_std > 0:
                 _spy_sharpe = float(_spy_dr.mean() / _spy_std * np.sqrt(252))
+
+            # SPY total return over period → Excess Return
+            _spy_total_return = float(_spy_aligned.iloc[-1] / _spy_aligned.iloc[0] - 1)
+            _excess_return    = m["total_return"] - _spy_total_return
+
+            # Information Ratio: per-trade excess returns vs SPY
+            if not bt["trades"].empty:
+                _ex_list = []
+                for _, _tr in bt["trades"].iterrows():
+                    _p0 = spy_close.asof(_tr["entry_date"])
+                    _p1 = spy_close.asof(_tr["exit_date"])
+                    if pd.notna(_p0) and pd.notna(_p1) and float(_p0) > 0:
+                        _spy_tr = (float(_p1) - float(_p0)) / float(_p0)
+                        _ex_list.append(float(_tr["return"]) - _spy_tr)
+                if len(_ex_list) > 1:
+                    _ex_arr = np.array(_ex_list)
+                    _ex_std = float(_ex_arr.std())
+                    if _ex_std > 0:
+                        _info_ratio = float(_ex_arr.mean() / _ex_std)
 
     wr_color = "#10b981" if m["win_rate"] >= 0.5 else "#f43f5e"
     tr_color = _color(m["total_return"])
@@ -2434,6 +2465,39 @@ else:
         (c5, "平均单笔", f"{m['avg_return']:+.2%}", "每笔交易平均收益", _color(m["avg_return"])),
     ]
     for col, label, val, sub, color in cards:
+        col.markdown(f"""
+        <div class='bt-card'>
+          <div class='bt-label'>{label}</div>
+          <div class='bt-value' style='color:{color};'>{val}</div>
+          <div class='bt-sub'>{sub}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Second row: Excess Return · Information Ratio · Downside Deviation ────
+    _dd = m.get("downside_dev", 0.0)
+
+    _er_val   = f"{_excess_return:+.2%}" if _excess_return is not None else "N/A"
+    _er_color = (_color(_excess_return) if _excess_return is not None else C["muted"])
+    _er_sub   = (f"vs SPY同期 {_spy_total_return:+.2%}"
+                 if _spy_total_return is not None else "无SPY数据")
+
+    _ir_val   = f"{_info_ratio:.2f}" if _info_ratio is not None else "N/A"
+    _ir_color = (
+        C["up"]   if _info_ratio is not None and _info_ratio > 0.5  else
+        C["warn"] if _info_ratio is not None and _info_ratio >= 0   else
+        C["down"] if _info_ratio is not None                        else C["muted"]
+    )
+    _ir_sub   = "逐笔超额收益均值 / 标准差"
+
+    _dd_color = "#f43f5e" if _dd > 0.15 else "#f59e0b" if _dd > 0.08 else "#10b981"
+    _dd_sub   = "年化，仅计算负收益波动"
+
+    ex_c, ir_c, dd_c, _pad = st.columns([1, 1, 1, 2])
+    _row2 = [
+        (ex_c, "超额收益 (α)",  _er_val,            _er_sub,  _er_color),
+        (ir_c, "信息比率 (IR)", _ir_val,            _ir_sub,  _ir_color),
+        (dd_c, "下行偏差",      f"{_dd:.2%}",       _dd_sub,  _dd_color),
+    ]
+    for col, label, val, sub, color in _row2:
         col.markdown(f"""
         <div class='bt-card'>
           <div class='bt-label'>{label}</div>
