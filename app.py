@@ -522,6 +522,114 @@ def run_backtest(
     return {"trades": trades_df, "metrics": metrics, "equity": equity_series}
 
 
+@st.cache_data
+def run_robustness_test(
+    rets_tuple: tuple,
+    avg_hold: float,
+    n_sims: int = 1000,
+    noise_std: float = 0.005,
+) -> dict:
+    """
+    Monte Carlo noise-injection robustness test.
+
+    For each simulation, adds i.i.d. N(0, noise_std) to every trade return,
+    then recomputes the annualised Sharpe. Returns the percentile distribution
+    of 1000 Sharpe ratios to reveal whether the strategy's edge is real or
+    an artefact of a lucky few trades.
+    """
+    rets = np.array(rets_tuple, dtype=float)
+    n = len(rets)
+    if n < 3:
+        return {"error": "insufficient_trades"}
+
+    rng = np.random.default_rng(42)
+    # Shape: (n_sims, n_trades) — vectorised, no Python loop
+    noise    = rng.normal(0.0, noise_std, size=(n_sims, n))
+    sim_rets = rets[None, :] + noise          # broadcast original returns
+
+    periods_per_year = 252.0 / max(float(avg_hold), 1.0)
+    means   = sim_rets.mean(axis=1)           # (n_sims,)
+    stds    = sim_rets.std(axis=1)
+    sharpes = np.where(stds > 1e-9,
+                       means / stds * np.sqrt(periods_per_year),
+                       0.0)
+
+    p5   = float(np.percentile(sharpes, 5))
+    p50  = float(np.percentile(sharpes, 50))
+    p95  = float(np.percentile(sharpes, 95))
+    pct_pos = float((sharpes > 0).mean())     # fraction of sims with Sharpe > 0
+
+    return {
+        "p5": p5, "p50": p50, "p95": p95,
+        "pct_positive": pct_pos,
+        "sharpes": sharpes.tolist(),
+        "n_sims": n_sims,
+        "noise_std": noise_std,
+        "error": None,
+    }
+
+
+def build_robustness_chart(rb: dict, actual_sharpe: float, C: dict) -> go.Figure:
+    """Histogram of simulated Sharpe ratios with actual-Sharpe marker."""
+    sharpes = np.array(rb["sharpes"])
+    fig = go.Figure()
+
+    # Histogram
+    fig.add_trace(go.Histogram(
+        x=sharpes,
+        nbinsx=60,
+        marker_color=C.get("accent2", "#6366f1"),
+        opacity=0.75,
+        name="模拟夏普分布",
+        hovertemplate="夏普: %{x:.2f}<br>频次: %{y}<extra></extra>",
+    ))
+
+    # Percentile bands
+    for pct, val, label in [
+        (5,  rb["p5"],  "P5"),
+        (50, rb["p50"], "中位"),
+        (95, rb["p95"], "P95"),
+    ]:
+        fig.add_vline(
+            x=val,
+            line_dash="dash",
+            line_color=C.get("muted", "#94a3b8"),
+            line_width=1.2,
+            annotation_text=f"{label} {val:.2f}",
+            annotation_font_color=C.get("muted", "#94a3b8"),
+            annotation_font_size=10,
+        )
+
+    # Actual Sharpe marker
+    fig.add_vline(
+        x=actual_sharpe,
+        line_color=C.get("up", "#10b981"),
+        line_width=2,
+        annotation_text=f"实际 {actual_sharpe:.2f}",
+        annotation_font_color=C.get("up", "#10b981"),
+        annotation_font_size=11,
+    )
+
+    fig.update_layout(
+        height=200,
+        margin=dict(l=8, r=8, t=8, b=24),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color=C.get("text", "#e2e8f0"),
+        xaxis=dict(
+            title="夏普比率", title_font_size=10,
+            gridcolor=C.get("grid", "#1e2d4a"), tickfont_size=9,
+        ),
+        yaxis=dict(
+            title="频次", title_font_size=10,
+            gridcolor=C.get("grid", "#1e2d4a"), tickfont_size=9,
+        ),
+        showlegend=False,
+        bargap=0.05,
+    )
+    return fig
+
+
 def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.DataFrame, C: dict) -> go.Figure:
     bh = df["Close"] / float(df["Close"].iloc[0])
 
@@ -2537,6 +2645,112 @@ else:
                .map(_reason_style, subset=["退出原因"]),
             width="stretch",
         )
+
+    # ── Monte Carlo Robustness Test ───────────────────────────────────────────
+    _bt_muted2 = C["muted"]
+    st.markdown(
+        f"<div style='font-size:14px;font-weight:600;color:{C['text']};margin:18px 0 6px;'>"
+        "策略稳健性测试"
+        f"<span style='font-size:11px;font-weight:400;color:{_bt_muted2};margin-left:8px;'>"
+        "Monte Carlo 噪声注入 · 1000 次模拟 · 每笔扰动 ±0.5%</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner("正在运行稳健性模拟（1000 次）..."):
+        _rets_tuple = tuple(float(r) for r in bt["trades"]["return"])
+        rb = run_robustness_test(
+            _rets_tuple,
+            avg_hold=m["avg_hold_days"],
+            n_sims=1000,
+            noise_std=0.005,
+        )
+
+    if rb.get("error") == "insufficient_trades":
+        st.info("ℹ️ 交易笔数不足（< 3），无法进行稳健性测试。")
+    elif rb.get("error"):
+        st.warning(f"稳健性测试失败：{rb['error']}")
+    else:
+        _actual_sh = m["sharpe"]
+
+        # Robustness verdict
+        _p50  = rb["p50"]
+        _p5   = rb["p5"]
+        _p95  = rb["p95"]
+        _ppos = rb["pct_positive"]
+        _ci_width = _p95 - _p5
+
+        if _p5 > 0:
+            _verdict     = "稳健"
+            _verdict_c   = C["up"]
+            _verdict_tip = "90% 置信区间均为正，策略在噪声下仍可靠"
+        elif _p50 > 0 and _ppos >= 0.7:
+            _verdict     = "中性"
+            _verdict_c   = C["warn"]
+            _verdict_tip = "中位数为正但区间跨零，具有一定随机性"
+        else:
+            _verdict     = "脆弱"
+            _verdict_c   = C["down"]
+            _verdict_tip = "策略在随机扰动下大幅退化，可能依赖少数运气单"
+
+        # ── Metric row ──────────────────────────────────────────────────
+        _rb1, _rb2, _rb3, _rb4, _rb5 = st.columns(5)
+        _rb_sh_color = lambda v: C["up"] if v > 0.5 else C["warn"] if v >= 0 else C["down"]
+        _rb_cards = [
+            (_rb1, "中位夏普 (P50)",
+             f"{_p50:.2f}",
+             f"实际夏普 {_actual_sh:.2f}",
+             _rb_sh_color(_p50)),
+            (_rb2, "5th 分位夏普",
+             f"{_p5:.2f}",
+             "最差 5% 场景",
+             C["down"] if _p5 < 0 else C["warn"]),
+            (_rb3, "95th 分位夏普",
+             f"{_p95:.2f}",
+             "最好 5% 场景",
+             C["up"]),
+            (_rb4, "90% 置信区间宽度",
+             f"{_ci_width:.2f}",
+             "越窄越稳定",
+             C["warn"] if _ci_width > 1.5 else C["up"]),
+            (_rb5, "稳健性评级",
+             _verdict,
+             _verdict_tip,
+             _verdict_c),
+        ]
+        for _col, _lbl, _val, _sub, _clr in _rb_cards:
+            _col.markdown(f"""
+            <div class='bt-card'>
+              <div class='bt-label'>{_lbl}</div>
+              <div class='bt-value' style='color:{_clr};'>{_val}</div>
+              <div class='bt-sub'>{_sub}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Histogram ───────────────────────────────────────────────────
+        _rb_chart_col, _rb_note_col = st.columns([3, 1])
+        with _rb_chart_col:
+            st.plotly_chart(
+                build_robustness_chart(rb, _actual_sh, C),
+                width="stretch",
+            )
+        with _rb_note_col:
+            _rb_dim  = C["dim"]
+            _rb_text = C["text"]
+            _rb_ppos_c = C["up"] if _ppos >= 0.7 else C["warn"]
+            st.markdown(
+                f"<div style='font-size:11px;color:{_rb_dim};line-height:1.8;padding-top:12px;'>"
+                f"<b style='color:{_rb_text};'>测试方法</b><br>"
+                "对每笔历史收益加入"
+                "<span style='font-family:Space Mono,monospace;'> N(0, 0.5%) </span>"
+                "随机扰动，重复 1000 次，<br>每次重算年化夏普。"
+                "<br><br>"
+                f"<b style='color:{_rb_text};'>正 Sharpe 占比</b><br>"
+                f"<span style='font-family:Space Mono,monospace;color:{_rb_ppos_c};'>"
+                f"{_ppos:.1%}</span> 的模拟结果 > 0"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
 st.markdown("---")
 
