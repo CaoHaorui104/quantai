@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 import anthropic
 from datetime import datetime, timedelta
 import time
+import warnings
 
 try:
     from yfinance.exceptions import YFRateLimitError
@@ -327,43 +328,123 @@ def compute_regime(df: pd.DataFrame) -> dict:
     }
 
 
-def compute_signal_scores(df: pd.DataFrame, regime_info: dict | None = None) -> pd.Series:
-    """Signal score per bar, regime-aware: RSI oversold suppressed in DOWNTREND."""
+def compute_score(
+    df: pd.DataFrame,
+    idx: int,
+    regime_info: dict,
+) -> tuple[int, list[str]]:
+    """
+    Core scoring rule for a single bar — the single source of truth.
+
+    All signal rules live here exactly once.  Both the live signal display
+    (get_signal) and the historical backtest (compute_signal_scores) call this
+    function, so rules can never drift out of sync between the two paths.
+
+    Parameters
+    ----------
+    df          : full OHLCV + indicator DataFrame
+    idx         : integer position of the bar to score (negative indexing supported)
+    regime_info : output of compute_regime(df)
+
+    Returns
+    -------
+    score   : int  — positive = bullish pressure, negative = bearish
+    reasons : list[str] — human-readable explanations (ignored by backtest)
+    """
+    last   = df.iloc[idx]
+    prev   = df.iloc[idx - 1]
+    regime = str(regime_info["regimes"].iloc[idx])
+
+    if pd.isna(last["RSI"]) or pd.isna(last["MACD"]) or pd.isna(last["BB_Upper"]):
+        return 0, []
+
+    score   = 0
+    reasons: list[str] = []
+    rsi     = float(last["RSI"])
+
+    # ── RSI ──────────────────────────────────────────────────────────────────
+    # Oversold BUY signal is suppressed in DOWNTREND (regime filter)
+    if rsi < 35:
+        if regime == "DOWNTREND":
+            reasons.append(f"RSI={rsi:.1f} → 超卖，但趋势向下，买入信号被抑制")
+        else:
+            score += 2
+            reasons.append(f"RSI={rsi:.1f} → 超卖区间，有反弹预期")
+    elif rsi > 70:
+        score -= 2
+        reasons.append(f"RSI={rsi:.1f} → 超买区间，存在回调风险")
+    else:
+        reasons.append(f"RSI={rsi:.1f} → 中性区间")
+
+    # ── MACD crossover ───────────────────────────────────────────────────────
+    if last["MACD"] > last["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
+        score += 2
+        reasons.append("MACD 金叉 → 短期看涨信号")
+    elif last["MACD"] < last["MACD_Signal"] and prev["MACD"] >= prev["MACD_Signal"]:
+        score -= 2
+        reasons.append("MACD 死叉 → 短期看跌信号")
+
+    # ── MA20 vs MA50 crossover ───────────────────────────────────────────────
+    if (pd.notna(last.get("MA20")) and pd.notna(last.get("MA50")) and
+            pd.notna(prev.get("MA20")) and pd.notna(prev.get("MA50"))):
+        if last["MA20"] > last["MA50"] and prev["MA20"] <= prev["MA50"]:
+            score += 1
+            reasons.append("均线金叉 (MA20>MA50) → 中期趋势转强")
+        elif last["MA20"] < last["MA50"] and prev["MA20"] >= prev["MA50"]:
+            score -= 1
+            reasons.append("均线死叉 (MA20<MA50) → 中期趋势转弱")
+
+    # ── Bollinger Bands ──────────────────────────────────────────────────────
+    if last["Close"] < last["BB_Lower"]:
+        score += 1
+        reasons.append("价格跌破布林带下轨 → 短期超卖")
+    elif last["Close"] > last["BB_Upper"]:
+        score -= 1
+        reasons.append("价格突破布林带上轨 → 短期超买")
+
+    return score, reasons
+
+
+def compute_signal_scores(
+    df: pd.DataFrame,
+    regime_info: dict | None = None,
+) -> pd.Series:
+    """
+    Time-weighted score series for ALL bars.
+
+    Pass 1 — raw score for every bar via compute_score (single source of truth).
+    Pass 2 — 3-day exponential-style weighting:
+        weighted[i] = 0.5 * raw[i] + 0.3 * raw[i-1] + 0.2 * raw[i-2]
+    When fewer than 3 scored bars precede i, weights are renormalised so the
+    result stays on the same scale as the raw score:
+        i == 1  (only today):              weighted = raw[i]
+        i == 2  (today + yesterday):       weighted = (0.5·r[i] + 0.3·r[i-1]) / 0.8
+        i >= 3  (full 3-day history):      weighted = 0.5·r[i] + 0.3·r[i-1] + 0.2·r[i-2]
+
+    Used by run_backtest for entry decisions; reasons are discarded.
+    """
     if regime_info is None:
         regime_info = compute_regime(df)
-    regimes = regime_info["regimes"]
+    n = len(df)
 
-    scores = pd.Series(0.0, index=df.index)
-    for i in range(1, len(df)):
-        last = df.iloc[i]
-        prev = df.iloc[i - 1]
-        if pd.isna(last["RSI"]) or pd.isna(last["MACD"]) or pd.isna(last["BB_Upper"]):
-            continue
-        s = 0
-        rsi    = last["RSI"]
-        regime = regimes.iloc[i]
+    # Pass 1: raw integer score for each bar (bar 0 stays 0 — no prev bar)
+    raw = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        s, _ = compute_score(df, i, regime_info)
+        raw[i] = float(s)
 
-        # RSI — oversold BUY signal blocked in DOWNTREND
-        if rsi < 35 and regime != "DOWNTREND":
-            s += 2
-        elif rsi > 70:
-            s -= 2
+    # Pass 2: 3-day time weighting with renormalised fallback
+    _W = (0.5, 0.3, 0.2)
+    weighted = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        if i >= 3:
+            weighted[i] = _W[0]*raw[i] + _W[1]*raw[i-1] + _W[2]*raw[i-2]
+        elif i == 2:
+            weighted[i] = (_W[0]*raw[i] + _W[1]*raw[i-1]) / (_W[0] + _W[1])
+        else:                       # i == 1: only one scored bar
+            weighted[i] = raw[i]
 
-        if last["MACD"] > last["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
-            s += 2
-        elif last["MACD"] < last["MACD_Signal"] and prev["MACD"] >= prev["MACD_Signal"]:
-            s -= 2
-        if pd.notna(last.get("MA20")) and pd.notna(last.get("MA50")):
-            if last["MA20"] > last["MA50"] and prev["MA20"] <= prev["MA50"]:
-                s += 1
-            elif last["MA20"] < last["MA50"] and prev["MA20"] >= prev["MA50"]:
-                s -= 1
-        if last["Close"] < last["BB_Lower"]:
-            s += 1
-        elif last["Close"] > last["BB_Upper"]:
-            s -= 1
-        scores.iloc[i] = s
-    return scores
+    return pd.Series(weighted, index=df.index)
 
 
 def run_backtest(
@@ -416,7 +497,7 @@ def run_backtest(
             if regime_info["vol_filter"].iloc[i]:
                 continue
             # UPTREND: go with trend (score >= 2.0); RANGE: standard (score >= 2.5)
-            entry_threshold = 2.0 if cur_reg == "UPTREND" else 2.5
+            entry_threshold = 1.5 if cur_reg == "UPTREND" else 2.0
             if scores.iloc[i] >= entry_threshold:
                 entry_idx = i + 1
                 entry_price = float(closes[entry_idx]) * (1 + slippage + commission)
@@ -679,66 +760,42 @@ def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.Data
 def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
-    Threshold table (weighted_score = float(raw_score)):
-      UPTREND   – BUY if weighted_score >= 2.0  (go with trend, lower bar)
-      RANGE     – BUY if weighted_score >= 2.5  (standard, requires 3 pts)
+    Scoring rules live exclusively in compute_score(); this function adds the
+    regime-threshold layer and the volatility-filter override on top, and
+    applies the same 3-day time weighting used by compute_signal_scores.
+
+    Threshold table (applied to weighted_score):
+      UPTREND   – BUY if weighted_score >= 1.5  (go with trend, lower bar)
+      RANGE     – BUY if weighted_score >= 2.0  (standard)
       DOWNTREND – BUY blocked entirely
-    SELL always triggers at raw_score <= -2 regardless of regime.
+    SELL uses raw_score <= -2 (today's score only — no dampening by history).
     """
     regime_info = compute_regime(df)
     regime      = regime_info["current"]
 
-    reasons = []
-    score   = 0
-    last    = df.iloc[-1]
-    prev    = df.iloc[-2]
+    # Today's raw score + human-readable reasons
+    raw_score, reasons = compute_score(df, -1, regime_info)
+    _n = len(df)
 
-    # RSI
-    rsi = last["RSI"]
-    if rsi < 35:
-        if regime == "DOWNTREND":
-            reasons.append(f"RSI={rsi:.1f} → 超卖，但趋势向下，买入信号被抑制")
-        else:
-            score += 2
-            reasons.append(f"RSI={rsi:.1f} → 超卖区间，有反弹预期")
-    elif rsi > 70:
-        score -= 2
-        reasons.append(f"RSI={rsi:.1f} → 超买区间，存在回调风险")
+    # 3-day time-weighted score — mirrors compute_signal_scores weighting exactly
+    # compute_score(df, -k, ...) uses df.iloc[-k] and df.iloc[-k-1],
+    # so -2 requires n>=3, -3 requires n>=4.
+    _s0 = float(raw_score)
+    _s1 = float(compute_score(df, -2, regime_info)[0]) if _n >= 3 else 0.0
+    _s2 = float(compute_score(df, -3, regime_info)[0]) if _n >= 4 else 0.0
+
+    if _n >= 4:
+        weighted_score = 0.5*_s0 + 0.3*_s1 + 0.2*_s2
+    elif _n >= 3:
+        weighted_score = (0.5*_s0 + 0.3*_s1) / 0.8
     else:
-        reasons.append(f"RSI={rsi:.1f} → 中性区间")
-
-    # MACD crossover
-    if last["MACD"] > last["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
-        score += 2
-        reasons.append("MACD 金叉 → 短期看涨信号")
-    elif last["MACD"] < last["MACD_Signal"] and prev["MACD"] >= prev["MACD_Signal"]:
-        score -= 2
-        reasons.append("MACD 死叉 → 短期看跌信号")
-
-    # MA crossover (MA20 vs MA50)
-    if "MA20" in df.columns and "MA50" in df.columns:
-        if last["MA20"] > last["MA50"] and prev["MA20"] <= prev["MA50"]:
-            score += 1
-            reasons.append("均线金叉 (MA20>MA50) → 中期趋势转强")
-        elif last["MA20"] < last["MA50"] and prev["MA20"] >= prev["MA50"]:
-            score -= 1
-            reasons.append("均线死叉 (MA20<MA50) → 中期趋势转弱")
-
-    # Price vs Bollinger
-    if last["Close"] < last["BB_Lower"]:
-        score += 1
-        reasons.append("价格跌破布林带下轨 → 短期超卖")
-    elif last["Close"] > last["BB_Upper"]:
-        score -= 1
-        reasons.append("价格突破布林带上轨 → 短期超买")
+        weighted_score = _s0
 
     # Regime-adjusted thresholds
-    raw_score      = score
-    weighted_score = float(score)
     if regime == "UPTREND":
-        buy_threshold = 2.0
+        buy_threshold = 1.5
     elif regime == "RANGE":
-        buy_threshold = 2.5
+        buy_threshold = 2.0
     else:                       # DOWNTREND — BUY completely forbidden
         buy_threshold = None
 
@@ -756,7 +813,7 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
 
     if buy_threshold is not None and weighted_score >= buy_threshold:
         return "BUY", reasons, regime_info
-    elif score <= -2:
+    elif raw_score <= -2:           # SELL uses today's raw score — no history dampening
         return "SELL", reasons, regime_info
     else:
         return "HOLD", reasons, regime_info
@@ -764,7 +821,9 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, period: str) -> pd.DataFrame:
-    # Let YFRateLimitError and network errors propagate to the caller for friendly UI handling
+    # auto_adjust=True: yfinance returns split- and dividend-adjusted prices in the
+    # "Close" (and Open/High/Low) columns.  There is no separate "Adj Close" column —
+    # df["Close"] IS the adjusted close, so all feature engineering is split-safe.
     df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
     if df.empty:
         return df
@@ -1062,29 +1121,101 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
 
 @st.cache_data(ttl=600)
 def run_garch_forecast(returns_tuple: tuple, dates_tuple: tuple, n_forecast: int = 30) -> dict:
+    """
+    Rolling-window GARCH(1,1) with strict out-of-sample conditional volatility.
+
+    Each point in the historical vol series is a 1-step-ahead forecast produced
+    by a model trained ONLY on past data — no future information used.
+
+    Implementation details
+    ──────────────────────
+    • ROLL_WIN : rolling training window length (up to 252 days)
+    • MIN_WIN  : minimum observations before first fit (63 days = ~3 months)
+    • STRIDE   : refit every STRIDE days; between refits the vol is linearly
+                 interpolated.  STRIDE is adaptive: targets ≤ 80 total refits
+                 so runtime stays < ~8 s even on multi-year series.
+    • Warm-start: each fit is initialised from the previous fit's parameters,
+                 which dramatically reduces iterations and speeds up the loop.
+    • Final fit : uses the most recent ROLL_WIN days; its horizon=30 forecast
+                 drives the forward vol prediction cards.
+    """
     try:
         from arch import arch_model
     except ImportError:
         return {"error": "arch_missing"}
     try:
-        returns_scaled = np.array(returns_tuple) * 100  # scale for numerical stability
-        model = arch_model(returns_scaled, vol="Garch", p=1, q=1, dist="Normal", rescale=False)
-        fitted = model.fit(disp="off", show_warning=False)
+        rets_raw    = np.array(returns_tuple, dtype=float)
+        rets_scaled = rets_raw * 100          # scale to % for numerical stability
+        n           = len(rets_scaled)
 
-        # Historical conditional volatility (annualised %)
-        cond_vol_pct = pd.Series(fitted.conditional_volatility) / 100 * np.sqrt(252) * 100
+        MIN_WIN  = 63                         # ~3 months minimum
+        ROLL_WIN = min(252, n)                # up to 1 year rolling window
+        # Adaptive stride: target ≤ 80 refits so the loop stays fast
+        STRIDE   = max(5, (n - MIN_WIN) // 80) if n > MIN_WIN else 5
 
-        # 20-day rolling realised volatility (annualised %)
-        raw = pd.Series(np.array(returns_tuple))
-        realized_pct = raw.rolling(20).std() * np.sqrt(252) * 100
+        if n < MIN_WIN + 5:
+            return {"error": "insufficient_data"}
 
-        # 30-day forecast
-        fc = fitted.forecast(horizon=n_forecast, reindex=False)
-        fc_var = fc.variance.iloc[-1].values          # shape (n_forecast,)
-        fc_vol_daily_pct = np.sqrt(fc_var) / 100 * 100   # daily vol %
-        fc_vol_annual_pct = fc_vol_daily_pct * np.sqrt(252)
+        # ── Rolling OOS conditional volatility ────────────────────────────
+        # For each fit point t, train on rets_scaled[start:t] and produce a
+        # 1-step-ahead forecast representing vol for the NEXT trading day.
+        # We assign that forecast to index t (the day being predicted).
+        oos_vol      = np.full(n, np.nan)
+        last_params  = None                   # warm-start cache
 
-        avg_fc = float(fc_vol_annual_pct.mean())
+        fit_points = list(range(MIN_WIN, n, STRIDE))
+        if (n - 1) not in fit_points:
+            fit_points.append(n - 1)
+
+        for t in fit_points:
+            start  = max(0, t - ROLL_WIN)
+            window = rets_scaled[start:t]
+            if len(window) < 30:
+                continue
+            try:
+                m   = arch_model(window, vol="Garch", p=1, q=1,
+                                 dist="Normal", rescale=False)
+                kw  = {"disp": "off", "show_warning": False}
+                if last_params is not None:
+                    kw["starting_values"] = last_params
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")   # mute StartingValueWarning etc.
+                    fit = m.fit(**kw)
+                last_params = fit.params.values.copy()   # save for warm-start
+
+                # 1-step-ahead forecast → annualised %
+                fc_var = float(
+                    fit.forecast(horizon=1, reindex=False).variance.iloc[-1, 0]
+                )
+                oos_vol[t] = np.sqrt(fc_var) / 100 * np.sqrt(252) * 100
+            except Exception:
+                last_params = None            # reset on convergence failure
+
+        # Fill sparse stride gaps by linear interpolation, then forward/back-fill
+        oos_series = (
+            pd.Series(oos_vol)
+            .interpolate(method="linear")
+            .bfill()
+            .ffill()
+        )
+
+        # ── Final fit on most recent ROLL_WIN days → 30-day forward forecast
+        final_window = rets_scaled[max(0, n - ROLL_WIN):]
+        m_final  = arch_model(final_window, vol="Garch", p=1, q=1,
+                              dist="Normal", rescale=False)
+        kw_final = {"disp": "off", "show_warning": False}
+        if last_params is not None:
+            kw_final["starting_values"] = last_params
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted_final = m_final.fit(**kw_final)
+
+        fc_final        = fitted_final.forecast(horizon=n_forecast, reindex=False)
+        fc_var_arr      = fc_final.variance.iloc[-1].values
+        fc_vol_daily    = np.sqrt(fc_var_arr) / 100 * 100   # daily vol %
+        fc_vol_annual   = fc_vol_daily * np.sqrt(252)
+
+        avg_fc = float(fc_vol_annual.mean())
         if avg_fc < 15:
             risk_level, risk_color = "低风险",   "#10b981"
         elif avg_fc < 30:
@@ -1094,24 +1225,34 @@ def run_garch_forecast(returns_tuple: tuple, dates_tuple: tuple, n_forecast: int
         else:
             risk_level, risk_color = "极高风险", "#f43f5e"
 
-        p = fitted.params
+        p     = fitted_final.params
         alpha = float(p.get("alpha[1]", 0))
         beta  = float(p.get("beta[1]",  0))
 
+        # 20-day rolling realised volatility for comparison chart
+        realized_pct = (
+            pd.Series(rets_raw).rolling(20).std() * np.sqrt(252) * 100
+        )
+
+        current_vol = float(oos_series.iloc[-1])
+
         return {
             "dates":          list(dates_tuple),
-            "cond_vol_pct":   cond_vol_pct.tolist(),
+            "cond_vol_pct":   oos_series.tolist(),      # ← strict OOS, no lookahead
             "realized_pct":   realized_pct.fillna(0).tolist(),
-            "fc_vol_annual":  fc_vol_annual_pct.tolist(),
-            "fc_vol_daily":   fc_vol_daily_pct.tolist(),
-            "current_vol":    float(cond_vol_pct.iloc[-1]),
+            "fc_vol_annual":  fc_vol_annual.tolist(),
+            "fc_vol_daily":   fc_vol_daily.tolist(),
+            "current_vol":    current_vol,
             "avg_fc_annual":  avg_fc,
             "risk_level":     risk_level,
             "risk_color":     risk_color,
-            "alpha":  alpha,
-            "beta":   beta,
-            "persistence": alpha + beta,
-            "error":  None,
+            "alpha":          alpha,
+            "beta":           beta,
+            "persistence":    alpha + beta,
+            "roll_window":    ROLL_WIN,
+            "stride":         STRIDE,
+            "n_refits":       len(fit_points),
+            "error":          None,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1127,7 +1268,7 @@ def build_garch_hist_chart(g: dict, C: dict) -> go.Figure:
     ))
     fig.add_trace(go.Scatter(
         x=g["dates"], y=g["cond_vol_pct"],
-        name="GARCH 条件波动率",
+        name="GARCH 样本外预测波动率",
         line=dict(color=C["accent2"], width=2),
         fill="tozeroy", fillcolor="rgba(167,139,250,0.07)",
     ))
@@ -1742,6 +1883,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
     HORIZON  = 5
     MIN_ROWS = 100
     N_SPLITS = 5
+    EMBARGO  = 5   # trading-day gap between train end and test start (prevents lookahead)
 
     try:
         X      = np.array(feat_rows)
@@ -1769,18 +1911,34 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         _cols = _feat_names[:_n_feats]
         _df = lambda arr: pd.DataFrame(arr, columns=_cols)
 
+        # ── Embargo helper ────────────────────────────────────────────────────
+        def _embargoed_splits(cv, X, embargo=EMBARGO):
+            """
+            Wrap any CV splitter: drop the last `embargo` rows from each
+            training set so there is a dead-zone between train end and test
+            start.  This prevents feature-window bleed (e.g. a 5-day rolling
+            feature computed near the fold boundary can leak future returns).
+            Folds where the embargoed train set shrinks below 20 rows are skipped.
+            """
+            for tr, te in cv.split(X):
+                cutoff  = te[0] - embargo          # first valid train index
+                tr_emb  = tr[tr < cutoff]
+                if len(tr_emb) >= 20:
+                    yield tr_emb, te
+
         # ── Hyperparameter tuning (inner CV, 3 folds) ────────────────────────
-        # Each fold gets its own scaler fitted only on that fold's train split
-        # to prevent mean/std statistics from leaking across fold boundaries.
+        # • Each fold gets its own scaler fitted ONLY on that fold's train split
+        #   → prevents mean/std statistics from leaking across fold boundaries.
+        # • Embargo applied to inner folds for the same lookahead-free guarantee.
         inner_cv = TimeSeriesSplit(n_splits=3)
         rng = np.random.default_rng(42)
 
         def _cv_dir_acc(estimator, X_raw, ys, cv, as_df=False):
             scores = []
-            for tr, te in cv.split(X_raw):
+            for tr, te in _embargoed_splits(cv, X_raw):   # ← embargo applied
                 if len(tr) < 20:
                     continue
-                sc = StandardScaler()
+                sc = StandardScaler()                       # ← per-fold scaler
                 Xtr_s = sc.fit_transform(X_raw[tr])
                 Xte_s = sc.transform(X_raw[te])
                 Xtr_ = _df(Xtr_s) if as_df else Xtr_s
@@ -1846,15 +2004,18 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             if s > best_lgb_score:
                 best_lgb_score, best_lgb_p = s, p
 
-        # ── Walk-forward evaluation (N_SPLITS folds) ─────────────────────────
+        # ── Walk-forward evaluation (N_SPLITS folds, with embargo) ───────────
+        # Pre-compute all outer splits once so the same list is reused for OOS.
         tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+        outer_splits = list(_embargoed_splits(tscv, X_v))   # [(tr, te), ...]
+
         fold_accs = {m: [] for m in
                      ["Ridge", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]}
 
-        for fold_tr, fold_te in tscv.split(X_v):
+        for fold_tr, fold_te in outer_splits:
             if len(fold_tr) < 30 or len(fold_te) < 30:
                 continue
-            sc = StandardScaler()
+            sc = StandardScaler()                            # ← per-fold scaler
             Xtr = sc.fit_transform(X_v[fold_tr])
             Xte = sc.transform(X_v[fold_te])
             y5_tr, y5_te = y5[fold_tr], y5[fold_te]
@@ -1914,9 +2075,9 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         importance = rf_f.feature_importances_[:_n_feats].tolist()
         feat_names = _cols
 
-        # OOS series from last fold
-        last_tr, last_te = list(tscv.split(X_v))[-1]
-        sc_oos = StandardScaler()
+        # OOS series from last embargoed fold (reuse pre-computed outer_splits)
+        last_tr, last_te = outer_splits[-1]
+        sc_oos = StandardScaler()                            # ← per-fold scaler
         Xtr_oos, Xte_oos = sc_oos.fit_transform(X_v[last_tr]), sc_oos.transform(X_v[last_te])
         Xtr_oos_df, Xte_oos_df = _df(Xtr_oos), _df(Xte_oos)
         y5_last = y5[last_tr]
@@ -1958,6 +2119,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             "oos": oos,
             "actual_5d":   (y5[last_te] * 100).tolist(),
             "horizon": HORIZON, "n_total": valid_n, "n_splits": N_SPLITS,
+            "embargo": EMBARGO,
             "error": None,
         }
     except Exception as e:
@@ -2760,6 +2922,8 @@ _mu  = round(float(_daily_ret.mean()), 8)
 _sig = round(float(_daily_ret.std()),  8)
 
 # ── Prepare ML features (needed before tabs so cache key is stable) ───────────
+# df["Close"] is already split/dividend-adjusted (fetch_data uses auto_adjust=True),
+# so all price-based features below are free from stock-split contamination.
 _close_arr = df["Close"].values.astype(float)
 _high_arr  = df["High"].values.astype(float)
 _low_arr   = df["Low"].values.astype(float)
@@ -2904,7 +3068,7 @@ with mc_tab:
         st.plotly_chart(build_mc_dist_chart(mc, C), width="stretch")
 
 with garch_tab:
-    with st.spinner("正在拟合 GARCH(1,1) 模型..."):
+    with st.spinner("正在滚动拟合 GARCH(1,1)（样本外，多次 refit）..."):
         _ret_tuple   = tuple(_daily_ret.values.round(8))
         _dates_tuple = tuple(_daily_ret.index.strftime("%Y-%m-%d"))
         g = run_garch_forecast(_ret_tuple, _dates_tuple)
@@ -2918,7 +3082,7 @@ with garch_tab:
         g1, g2, g3, g4 = st.columns(4)
         _risk_c = g["risk_color"]
         _g_cards = [
-            (g1, "当前条件波动率",    f"{g['current_vol']:.1f}%",     "GARCH 最新估计（年化）", "#a78bfa"),
+            (g1, "当前条件波动率",    f"{g['current_vol']:.1f}%",     "样本外预测（年化）", "#a78bfa"),
             (g2, "30日预测均值",      f"{g['avg_fc_annual']:.1f}%",   "预测年化波动率均值",     _risk_c),
             (g3, "波动率风险评级",    g["risk_level"],                 "",                       _risk_c),
             (g4, "持续性 α+β",        f"{g['persistence']:.4f}",      "越接近1波动率衰减越慢",  "#f59e0b"),
@@ -2938,7 +3102,7 @@ with garch_tab:
         with hist_col:
             st.markdown(
                 f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
-                "历史波动率 vs GARCH 条件波动率</div>",
+                f"已实现波动率 vs GARCH 样本外预测（窗口 {g['roll_window']}日 · 步长 {g['stride']}日 · refit {g['n_refits']} 次）</div>",
                 unsafe_allow_html=True,
             )
             st.plotly_chart(build_garch_hist_chart(g, C), width="stretch")
@@ -2951,12 +3115,15 @@ with garch_tab:
             st.plotly_chart(build_garch_forecast_chart(g, C), width="stretch")
 
         # ── Model params ──────────────────────────────────────────────────
+        _g_dim = C["dim"]
         st.markdown(
-            f"<div style='font-size:11px;color:{C['dim']};margin-top:4px;'>"
-            f"GARCH(1,1) 参数 &nbsp;·&nbsp; "
+            f"<div style='font-size:11px;color:{_g_dim};margin-top:4px;'>"
+            f"最终窗口 GARCH(1,1) 参数 &nbsp;·&nbsp; "
             f"α (ARCH) = {g['alpha']:.5f} &nbsp;·&nbsp; "
             f"β (GARCH) = {g['beta']:.5f} &nbsp;·&nbsp; "
-            f"持续性 α+β = {g['persistence']:.5f}"
+            f"持续性 α+β = {g['persistence']:.5f} &nbsp;·&nbsp; "
+            f"滚动窗口 {g['roll_window']}日 · 步长 {g['stride']}日 · "
+            f"历史曲线为严格样本外预测（共 refit {g['n_refits']} 次）"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -3083,12 +3250,14 @@ with ml_tab:
         )
         st.plotly_chart(build_ml_backtest_chart(ml, C), width="stretch")
 
+        _ml_dim = C["dim"]
         st.markdown(
-            f"<div style='font-size:11px;color:{C['dim']};margin-top:4px;'>"
+            f"<div style='font-size:11px;color:{_ml_dim};margin-top:4px;'>"
             f"目标：未来5日收益率（回归） &nbsp;·&nbsp; "
-            f"特征（17维·滚动Z分标准化）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
+            f"特征（17维·滚动Z分·已调权价格）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
             f"模型：Ridge + RandomForest + XGBoost + LightGBM &nbsp;·&nbsp; "
-            f"验证：Walk-Forward {ml['n_splits']} 折 &nbsp;·&nbsp; 超参数：自动调优（内层 3 折）</div>",
+            f"验证：Walk-Forward {ml['n_splits']} 折（Embargo {ml['embargo']}日）&nbsp;·&nbsp; "
+            f"超参数：自动调优（内层 3 折）</div>",
             unsafe_allow_html=True,
         )
 
