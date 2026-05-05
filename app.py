@@ -467,15 +467,17 @@ def run_backtest(
 ) -> dict:
     """
     Simulate the signal strategy on historical data.
-    Entry on BUY (score >= threshold) at next-day close.
+    Entry on BUY (score >= threshold) at next-day open.
     Exit priority: stop-loss → take-profit → 时间止损 → sell signal → max holding days.
-      时间止损: hold >= time_stop_days AND pnl < time_stop_min_pnl (stagnant trade cut).
+      SL/TP/时间止损: triggered by close price, executed at that same close.
+      Signal/hold/end exits: executed at next-day open.
     Slippage and commission are applied on both entry and exit legs.
     """
     regime_info = compute_regime(df)
     scores  = compute_signal_scores(df, regime_info=regime_info, rsi_weight=rsi_weight)
     regimes = regime_info["regimes"]
     closes  = df["Close"].values
+    opens   = df["Open"].values
     highs   = df["High"].values
     lows    = df["Low"].values
     dates   = df.index
@@ -533,7 +535,8 @@ def run_backtest(
             entry_threshold = uptrend_thr if cur_reg == "UPTREND" else range_thr
             if scores.iloc[i] >= entry_threshold:
                 entry_idx = i + 1
-                entry_price    = float(closes[entry_idx]) * (1 + slippage + commission)
+                # Execute at next-day open (more realistic than close-to-close)
+                entry_price    = float(opens[entry_idx]) * (1 + slippage + commission)
                 entry_position = _position_size(i)   # ATR ratio at signal bar
                 in_trade = True
         else:
@@ -553,21 +556,24 @@ def run_backtest(
             else:
                 continue
 
-            # SL/TP/时间止损 triggers on current bar close; signal exits on next-day close
+            # SL/TP/时间止损: trigger on close, exit at that same close (intraday stop)
+            # Signal/hold exits: execute at next-day open
             if reason.startswith("止") or reason == "时间止损":
                 exit_idx = i
                 exit_price = float(closes[i]) * (1 - slippage - commission)
+                _exit_display = float(closes[i])
             else:
                 exit_idx = min(i + 1, n - 1)
-                exit_price = float(closes[exit_idx]) * (1 - slippage - commission)
+                exit_price = float(opens[exit_idx]) * (1 - slippage - commission)
+                _exit_display = float(opens[exit_idx])
 
             raw_ret = (exit_price - entry_price) / entry_price
             pos_ret = raw_ret * entry_position   # position-weighted return
             trades.append({
                 "entry_date":  dates[entry_idx],
                 "exit_date":   dates[exit_idx],
-                "entry_price": round(float(closes[entry_idx]), 2),
-                "exit_price":  round(float(closes[exit_idx]), 2),
+                "entry_price": round(float(opens[entry_idx]), 2),
+                "exit_price":  round(_exit_display, 2),
                 "return":      pos_ret,
                 "raw_return":  raw_ret,
                 "position":    entry_position,
@@ -576,16 +582,16 @@ def run_backtest(
             })
             in_trade = False
 
-    # Close any open position at end
+    # Close any open position at end — use last bar's open as execution price
     if in_trade and entry_idx is not None:
-        exit_price = float(closes[-1]) * (1 - slippage - commission)
+        exit_price = float(opens[-1]) * (1 - slippage - commission)
         raw_ret = (exit_price - entry_price) / entry_price
         pos_ret = raw_ret * entry_position
         trades.append({
             "entry_date":  dates[entry_idx],
             "exit_date":   dates[-1],
-            "entry_price": round(float(closes[entry_idx]), 2),
-            "exit_price":  round(float(closes[-1]), 2),
+            "entry_price": round(float(opens[entry_idx]), 2),
+            "exit_price":  round(float(opens[-1]), 2),
             "return":      pos_ret,
             "raw_return":  raw_ret,
             "position":    entry_position,
@@ -801,12 +807,18 @@ def get_signal(
     uptrend_thr: float = 1.5,
     range_thr: float = 2.0,
     rsi_weight: int = 2,
+    spy_bear: bool = False,
+    insider_adj: float = 0.0,
+    near_earnings: bool = False,
 ) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
     Scoring rules live exclusively in compute_score(); this function adds the
-    regime-threshold layer and the volatility-filter override on top, and
-    applies the same 3-day time weighting used by compute_signal_scores.
+    regime-threshold layer, volatility-filter, and four extra filters:
+      1. Volume confirmation  — current volume must exceed 20-day average.
+      2. Cross-asset (SPY)   — BUY blocked when SPY MA20 < MA50.
+      3. Insider trading      — CEO/CFO large trades adjust weighted_score ±0.5.
+      4. Earnings proximity   — BUY blocked within 3 days of earnings.
 
     uptrend_thr / range_thr: BUY thresholds, adapted by Beta mode.
     rsi_weight: RSI score magnitude (2 standard, 1 for low-beta 稳健模式).
@@ -841,12 +853,17 @@ def get_signal(
     else:                       # DOWNTREND — BUY completely forbidden
         buy_threshold = None
 
+    # ── Filter 3: insider adj modifies weighted_score before threshold ──────────
+    if insider_adj > 0:
+        reasons.append(f"内部人(CEO/CFO)大额买入 → 加强信号 (+{insider_adj:.1f}分)")
+    elif insider_adj < 0:
+        reasons.append(f"内部人(CEO/CFO)大额卖出 → 压制信号 ({insider_adj:+.1f}分)")
+    weighted_score = weighted_score + insider_adj
+
     # Volatility filter — overrides buy_threshold regardless of regime
     if regime_info["vol_filter"].iloc[-1]:
         _atr_ratio = regime_info["cur_atr"] / max(regime_info["cur_atr_mean"], 1e-9)
-        reasons.append(
-            f"波动率过高（ATR {_atr_ratio:.1f}×均值），暂停买入"
-        )
+        reasons.append(f"波动率过高（ATR {_atr_ratio:.1f}×均值），暂停买入")
         buy_threshold = None
 
     regime_info["raw_score"]      = raw_score
@@ -854,6 +871,22 @@ def get_signal(
     regime_info["buy_threshold"]  = buy_threshold
 
     if buy_threshold is not None and weighted_score >= buy_threshold:
+        # ── Filter 1: volume confirmation ─────────────────────────────────────
+        _vol_series = df["Volume"]
+        _vol_avg20  = _vol_series.rolling(20, min_periods=5).mean()
+        _vol_now    = float(_vol_series.iloc[-1])
+        _vol_avg    = float(_vol_avg20.iloc[-1]) if not pd.isna(_vol_avg20.iloc[-1]) else 0.0
+        if _vol_avg > 0 and _vol_now <= _vol_avg:
+            reasons.append(f"成交量({_vol_now/1e6:.1f}M)低于20日均量({_vol_avg/1e6:.1f}M)，BUY未确认")
+            return "HOLD", reasons, regime_info
+        # ── Filter 2: cross-asset SPY bear market ─────────────────────────────
+        if spy_bear:
+            reasons.append("大盘趋势向下（SPY MA20<MA50），暂停个股买入")
+            return "HOLD", reasons, regime_info
+        # ── Filter 4: earnings proximity ──────────────────────────────────────
+        if near_earnings:
+            reasons.append("距财报日≤3天，规避财报风险，暂停买入")
+            return "HOLD", reasons, regime_info
         return "BUY", reasons, regime_info
     elif raw_score <= -2:           # SELL uses today's raw score — no history dampening
         return "SELL", reasons, regime_info
@@ -866,7 +899,22 @@ def fetch_data(ticker: str, period: str) -> pd.DataFrame:
     # auto_adjust=True: yfinance returns split- and dividend-adjusted prices in the
     # "Close" (and Open/High/Low) columns.  There is no separate "Adj Close" column —
     # df["Close"] IS the adjusted close, so all feature engineering is split-safe.
-    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    #
+    # Retry once on empty result: yfinance occasionally returns nothing for a
+    # specific (ticker, period) pair due to transient rate-limits or network
+    # blips.  Without a retry, @st.cache_data caches the empty DataFrame and
+    # every subsequent page-render returns the cached failure for 5 minutes.
+    df = pd.DataFrame()
+    for _attempt in range(2):
+        try:
+            df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        except Exception:
+            df = pd.DataFrame()
+        if not df.empty:
+            break
+        if _attempt == 0:
+            time.sleep(1)   # brief pause before retry
+
     if df.empty:
         return df
     if isinstance(df.columns, pd.MultiIndex):
@@ -973,17 +1021,28 @@ def fetch_earnings_and_insider(ticker: str) -> dict:
                                if pd.notna(val) and float(val) > 0 else "—")
                     shares = int(row.get("Shares", 0))
                     insider_rows.append({
-                        "日期":    str(row.get("Start Date", ""))[:10],
-                        "内部人":  str(row.get("Insider", "")).title(),
-                        "职位":    str(row.get("Position", "")),
-                        "类型":    _tx_type(str(row.get("Text", ""))),
-                        "股数":    f"{shares:,}",
-                        "交易额":  val_str,
+                        "日期":       str(row.get("Start Date", ""))[:10],
+                        "内部人":     str(row.get("Insider", "")).title(),
+                        "职位":       str(row.get("Position", "")),
+                        "类型":       _tx_type(str(row.get("Text", ""))),
+                        "股数":       f"{shares:,}",
+                        "交易额":     val_str,
+                        "shares_raw": shares,  # kept as int for signal computation
                     })
         except Exception:
             pass
 
-        return {"earnings": earnings, "insider": insider_rows, "error": None}
+        # Historical earnings dates for backtest earnings-proximity filter
+        all_earnings_dates: list[str] = []
+        try:
+            _ед = t.get_earnings_dates(limit=20)
+            if _ед is not None and not _ед.empty:
+                all_earnings_dates = [str(d)[:10] for d in _ед.index.tolist()]
+        except Exception:
+            pass
+
+        return {"earnings": earnings, "insider": insider_rows,
+                "all_earnings_dates": all_earnings_dates, "error": None}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1773,6 +1832,63 @@ def fetch_spy_6m() -> pd.Series:
         return pd.Series(dtype=float)
 
 
+@st.cache_data(ttl=300)
+def fetch_spy_full(period: str) -> pd.DataFrame:
+    """Fetch SPY OHLCV for the given period and compute MA20/MA50.
+    Returns a DataFrame with columns [Close, MA20, MA50] indexed by date.
+    Used for cross-asset bear-market filter in signals and backtest.
+    """
+    try:
+        spy = yf.download("SPY", period=period, progress=False, auto_adjust=True)
+        if spy.empty:
+            return pd.DataFrame()
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        out = spy[["Close"]].copy()
+        out["MA20"] = out["Close"].rolling(20).mean()
+        out["MA50"] = out["Close"].rolling(50).mean()
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def compute_insider_adj(insider_rows: list[dict]) -> float:
+    """Compute ±0.5 weighted_score adjustment from recent CEO/CFO insider trades.
+
+    Rules:
+    • Only transactions in the last 30 days count.
+    • Only CEO / CFO roles (position contains "Chief Executive" or "Chief Financial").
+    • Only trades of > 10 000 shares.
+    • Net direction: if buys dominate → +0.5; if sells dominate → -0.5; else 0.0.
+    """
+    cutoff = pd.Timestamp.today() - pd.Timedelta(days=30)
+    buy_shares = 0
+    sell_shares = 0
+    for row in insider_rows:
+        try:
+            tx_date = pd.Timestamp(row.get("日期", ""))
+        except Exception:
+            continue
+        if tx_date < cutoff:
+            continue
+        pos = row.get("职位", "").lower()
+        if "chief executive" not in pos and "chief financial" not in pos:
+            continue
+        shares = row.get("shares_raw", 0)
+        if shares <= 10_000:
+            continue
+        if row.get("类型") == "买入":
+            buy_shares += shares
+        elif row.get("类型") == "卖出":
+            sell_shares += shares
+
+    if buy_shares > sell_shares and buy_shares > 0:
+        return 0.5
+    if sell_shares > buy_shares and sell_shares > 0:
+        return -0.5
+    return 0.0
+
+
 def compute_risk_metrics(df: pd.DataFrame, spy_close: pd.Series, beta_from_info: float | None) -> dict:
     daily = df["Close"].pct_change().dropna()
     ann_vol = float(daily.std() * np.sqrt(252))
@@ -1968,19 +2084,16 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                 if len(tr_emb) >= 20:
                     yield tr_emb, te
 
-        # ── Hyperparameter tuning (inner CV, 3 folds) ────────────────────────
-        # • Each fold gets its own scaler fitted ONLY on that fold's train split
-        #   → prevents mean/std statistics from leaking across fold boundaries.
-        # • Embargo applied to inner folds for the same lookahead-free guarantee.
+        # ── Helpers shared by inner CV and walk-forward ──────────────────────
         inner_cv = TimeSeriesSplit(n_splits=3)
         rng = np.random.default_rng(42)
 
         def _cv_dir_acc(estimator, X_raw, ys, cv, as_df=False):
             scores = []
-            for tr, te in _embargoed_splits(cv, X_raw):   # ← embargo applied
+            for tr, te in _embargoed_splits(cv, X_raw):
                 if len(tr) < 20:
                     continue
-                sc = StandardScaler()                       # ← per-fold scaler
+                sc = StandardScaler()                       # per-inner-fold scaler
                 Xtr_s = sc.fit_transform(X_raw[tr])
                 Xte_s = sc.transform(X_raw[te])
                 Xtr_ = _df(Xtr_s) if as_df else Xtr_s
@@ -1991,95 +2104,95 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                 )))
             return float(np.mean(scores)) if scores else 0.5
 
-        # Ridge alpha search
-        best_ridge_alpha = max(
-            [0.01, 0.1, 1.0, 10.0, 100.0],
-            key=lambda a: _cv_dir_acc(Ridge(alpha=a), X_v, y5, inner_cv),
-        )
-
-        # RF grid (2 × 2)
-        best_rf_p = {"n_estimators": 100, "max_depth": 5, "min_samples_leaf": 4}
-        best_rf_score = -1.0
-        for n_est in [100, 150]:
-            for depth in [4, 6]:
-                p = {"n_estimators": n_est, "max_depth": depth, "min_samples_leaf": 4}
-                s = _cv_dir_acc(
-                    RandomForestRegressor(**p, random_state=42, n_jobs=1),
-                    X_v, y5, inner_cv,
-                )
-                if s > best_rf_score:
-                    best_rf_score, best_rf_p = s, p
-
-        # XGB random search (8 combos)
+        # Search-space definitions (shared by per-fold and global tuning)
         _xgb_space = {
             "n_estimators":  [100, 150, 200],
             "max_depth":     [3, 4, 5],
             "learning_rate": [0.05, 0.10, 0.15],
             "subsample":     [0.8, 0.9],
         }
-        best_xgb_p = {"n_estimators": 150, "max_depth": 4,
-                       "learning_rate": 0.10, "subsample": 0.8}
-        best_xgb_score = -1.0
-        for _ in range(8):
-            p = {k: v[int(rng.integers(len(v)))] for k, v in _xgb_space.items()}
-            s = _cv_dir_acc(
-                xgb.XGBRegressor(**p, random_state=42, verbosity=0, n_jobs=1),
-                X_v, y5, inner_cv,
-            )
-            if s > best_xgb_score:
-                best_xgb_score, best_xgb_p = s, p
-
-        # LGB random search (8 combos)
         _lgb_space = {
             "n_estimators":  [100, 150, 200],
             "num_leaves":    [15, 31, 63],
             "learning_rate": [0.05, 0.10, 0.15],
         }
-        best_lgb_p = {"n_estimators": 150, "num_leaves": 31, "learning_rate": 0.10}
-        best_lgb_score = -1.0
-        for _ in range(8):
-            p = {k: v[int(rng.integers(len(v)))] for k, v in _lgb_space.items()}
-            s = _cv_dir_acc(
-                lgb.LGBMRegressor(**p, random_state=42, verbose=-1, n_jobs=1),
-                X_v, y5, inner_cv, as_df=True,
-            )
-            if s > best_lgb_score:
-                best_lgb_score, best_lgb_p = s, p
 
-        # ── Walk-forward evaluation (N_SPLITS folds, with embargo) ───────────
-        # Pre-compute all outer splits once so the same list is reused for OOS.
+        def _tune_fold(X_raw, ys):
+            """Return best params for all four models using only X_raw/ys."""
+            ra = max(
+                [0.01, 0.1, 1.0, 10.0, 100.0],
+                key=lambda a: _cv_dir_acc(Ridge(alpha=a), X_raw, ys, inner_cv),
+            )
+            rf_p = {"n_estimators": 100, "max_depth": 5, "min_samples_leaf": 4}
+            _bs = -1.0
+            for n_est in [100, 150]:
+                for depth in [4, 6]:
+                    p = {"n_estimators": n_est, "max_depth": depth, "min_samples_leaf": 4}
+                    s = _cv_dir_acc(RandomForestRegressor(**p, random_state=42, n_jobs=1), X_raw, ys, inner_cv)
+                    if s > _bs:
+                        _bs, rf_p = s, p
+            xgb_p = {"n_estimators": 150, "max_depth": 4, "learning_rate": 0.10, "subsample": 0.8}
+            _bs = -1.0
+            for _ in range(8):
+                p = {k: v[int(rng.integers(len(v)))] for k, v in _xgb_space.items()}
+                s = _cv_dir_acc(xgb.XGBRegressor(**p, random_state=42, verbosity=0, n_jobs=1), X_raw, ys, inner_cv)
+                if s > _bs:
+                    _bs, xgb_p = s, p
+            lgb_p = {"n_estimators": 150, "num_leaves": 31, "learning_rate": 0.10}
+            _bs = -1.0
+            for _ in range(8):
+                p = {k: v[int(rng.integers(len(v)))] for k, v in _lgb_space.items()}
+                s = _cv_dir_acc(lgb.LGBMRegressor(**p, random_state=42, verbose=-1, n_jobs=1), X_raw, ys, inner_cv, as_df=True)
+                if s > _bs:
+                    _bs, lgb_p = s, p
+            return ra, rf_p, xgb_p, lgb_p
+
+        # ── Walk-forward evaluation — per-fold tuning + evaluation ───────────
+        # Each outer fold tunes hyperparameters ONLY on that fold's training
+        # data (via inner_cv), then evaluates on its embargoed test set.
+        # This eliminates look-ahead bias from global hyperparameter selection.
         tscv = TimeSeriesSplit(n_splits=N_SPLITS)
-        outer_splits = list(_embargoed_splits(tscv, X_v))   # [(tr, te), ...]
+        outer_splits = list(_embargoed_splits(tscv, X_v))
 
         fold_accs = {m: [] for m in
                      ["Ridge", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]}
 
+        last_fold_params = None   # track for OOS display
         for fold_tr, fold_te in outer_splits:
             if len(fold_tr) < 30 or len(fold_te) < 30:
                 continue
-            sc = StandardScaler()                            # ← per-fold scaler
+
+            # Tune on this fold's training data only
+            f_ridge, f_rf, f_xgb, f_lgb = _tune_fold(X_v[fold_tr], y5[fold_tr])
+
+            sc = StandardScaler()                            # per-outer-fold scaler
             Xtr = sc.fit_transform(X_v[fold_tr])
             Xte = sc.transform(X_v[fold_te])
             y5_tr, y5_te = y5[fold_tr], y5[fold_te]
 
             Xtr_df, Xte_df = _df(Xtr), _df(Xte)
             preds = {}
-            preds["Ridge"] = Ridge(alpha=best_ridge_alpha).fit(Xtr, y5_tr).predict(Xte)
+            preds["Ridge"] = Ridge(alpha=f_ridge).fit(Xtr, y5_tr).predict(Xte)
             preds["RandomForest"] = RandomForestRegressor(
-                **best_rf_p, random_state=42, n_jobs=1).fit(Xtr, y5_tr).predict(Xte)
+                **f_rf, random_state=42, n_jobs=1).fit(Xtr, y5_tr).predict(Xte)
             preds["XGBoost"] = xgb.XGBRegressor(
-                **best_xgb_p, random_state=42, verbosity=0, n_jobs=1).fit(Xtr, y5_tr).predict(Xte)
+                **f_xgb, random_state=42, verbosity=0, n_jobs=1).fit(Xtr, y5_tr).predict(Xte)
             preds["LightGBM"] = lgb.LGBMRegressor(
-                **best_lgb_p, random_state=42, verbose=-1, n_jobs=1).fit(Xtr_df, y5_tr).predict(Xte_df)
+                **f_lgb, random_state=42, verbose=-1, n_jobs=1).fit(Xtr_df, y5_tr).predict(Xte_df)
             preds["Ensemble"] = sum(preds.values()) / 4
 
             for name, p in preds.items():
                 fold_accs[name].append(
                     float(np.mean(np.sign(p) == np.sign(y5_te)))
                 )
+            last_fold_params = {"ridge_alpha": f_ridge, "rf": f_rf, "xgb": f_xgb, "lgb": f_lgb,
+                                 "tr": fold_tr, "te": fold_te}
 
         model_avg_acc = {k: float(np.mean(v)) if v else 0.0
                          for k, v in fold_accs.items()}
+
+        # ── Global tuning for final retrain (uses all X_v, not OOS) ──────────
+        best_ridge_alpha, best_rf_p, best_xgb_p, best_lgb_p = _tune_fold(X_v, y5)
 
         # ── Final retrain on all data ─────────────────────────────────────────
         scaler2   = StandardScaler()
@@ -2117,10 +2230,17 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         importance = rf_f.feature_importances_[:_n_feats].tolist()
         feat_names = _cols
 
-        # OOS series from last embargoed fold (reuse pre-computed outer_splits)
-        last_tr, last_te = outer_splits[-1]
-        sc_oos = StandardScaler()                            # ← per-fold scaler
-        Xtr_oos, Xte_oos = sc_oos.fit_transform(X_v[last_tr]), sc_oos.transform(X_v[last_te])
+        # OOS series from last fold — use that fold's own tuned params
+        last_tr = last_fold_params["tr"] if last_fold_params else outer_splits[-1][0]
+        last_te = last_fold_params["te"] if last_fold_params else outer_splits[-1][1]
+        _lf_ridge = last_fold_params["ridge_alpha"] if last_fold_params else best_ridge_alpha
+        _lf_rf    = last_fold_params["rf"]  if last_fold_params else best_rf_p
+        _lf_xgb   = last_fold_params["xgb"] if last_fold_params else best_xgb_p
+        _lf_lgb   = last_fold_params["lgb"] if last_fold_params else best_lgb_p
+
+        sc_oos = StandardScaler()
+        Xtr_oos = sc_oos.fit_transform(X_v[last_tr])
+        Xte_oos = sc_oos.transform(X_v[last_te])
         Xtr_oos_df, Xte_oos_df = _df(Xtr_oos), _df(Xte_oos)
         y5_last = y5[last_tr]
 
@@ -2128,10 +2248,10 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             return (est.fit(Xtr, y5_last).predict(Xte) * 100).tolist()
 
         oos = {
-            "Ridge":        _oos(Ridge(alpha=best_ridge_alpha)),
-            "RandomForest": _oos(RandomForestRegressor(**best_rf_p, random_state=42, n_jobs=1)),
-            "XGBoost":      _oos(xgb.XGBRegressor(**best_xgb_p, random_state=42, verbosity=0, n_jobs=1)),
-            "LightGBM":     _oos(lgb.LGBMRegressor(**best_lgb_p, random_state=42, verbose=-1, n_jobs=1),
+            "Ridge":        _oos(Ridge(alpha=_lf_ridge)),
+            "RandomForest": _oos(RandomForestRegressor(**_lf_rf, random_state=42, n_jobs=1)),
+            "XGBoost":      _oos(xgb.XGBRegressor(**_lf_xgb, random_state=42, verbosity=0, n_jobs=1)),
+            "LightGBM":     _oos(lgb.LGBMRegressor(**_lf_lgb, random_state=42, verbose=-1, n_jobs=1),
                                  Xtr=Xtr_oos_df, Xte=Xte_oos_df),
         }
         oos["Ensemble"] = [(a + b + c + d) / 4
