@@ -332,6 +332,7 @@ def compute_score(
     df: pd.DataFrame,
     idx: int,
     regime_info: dict,
+    rsi_weight: int = 2,
 ) -> tuple[int, list[str]]:
     """
     Core scoring rule for a single bar — the single source of truth.
@@ -345,6 +346,7 @@ def compute_score(
     df          : full OHLCV + indicator DataFrame
     idx         : integer position of the bar to score (negative indexing supported)
     regime_info : output of compute_regime(df)
+    rsi_weight  : RSI score magnitude (default 2; pass 1 for low-beta "稳健模式")
 
     Returns
     -------
@@ -363,15 +365,16 @@ def compute_score(
     rsi     = float(last["RSI"])
 
     # ── RSI ──────────────────────────────────────────────────────────────────
-    # Oversold BUY signal is suppressed in DOWNTREND (regime filter)
+    # Oversold BUY signal is suppressed in DOWNTREND (regime filter).
+    # rsi_weight controls magnitude (1 for low-beta stocks, 2 standard).
     if rsi < 35:
         if regime == "DOWNTREND":
             reasons.append(f"RSI={rsi:.1f} → 超卖，但趋势向下，买入信号被抑制")
         else:
-            score += 2
+            score += rsi_weight
             reasons.append(f"RSI={rsi:.1f} → 超卖区间，有反弹预期")
     elif rsi > 70:
-        score -= 2
+        score -= rsi_weight
         reasons.append(f"RSI={rsi:.1f} → 超买区间，存在回调风险")
     else:
         reasons.append(f"RSI={rsi:.1f} → 中性区间")
@@ -408,6 +411,7 @@ def compute_score(
 def compute_signal_scores(
     df: pd.DataFrame,
     regime_info: dict | None = None,
+    rsi_weight: int = 2,
 ) -> pd.Series:
     """
     Time-weighted score series for ALL bars.
@@ -430,7 +434,7 @@ def compute_signal_scores(
     # Pass 1: raw integer score for each bar (bar 0 stays 0 — no prev bar)
     raw = np.zeros(n, dtype=float)
     for i in range(1, n):
-        s, _ = compute_score(df, i, regime_info)
+        s, _ = compute_score(df, i, regime_info, rsi_weight=rsi_weight)
         raw[i] = float(s)
 
     # Pass 2: 3-day time weighting with renormalised fallback
@@ -454,24 +458,54 @@ def run_backtest(
     take_profit: float = 0.05,
     slippage: float = 0.001,
     commission: float = 0.001,
+    time_stop_enabled: bool = True,
+    time_stop_days: int = 5,
+    time_stop_min_pnl: float = 0.005,
+    uptrend_thr: float = 1.5,
+    range_thr: float = 2.0,
+    rsi_weight: int = 2,
 ) -> dict:
     """
     Simulate the signal strategy on historical data.
-    Entry on BUY (score >= 2) at next-day close.
+    Entry on BUY (score >= threshold) at next-day close.
     Exit priority: stop-loss → take-profit → 时间止损 → sell signal → max holding days.
-      时间止损: hold >= 5 bars AND pnl < +0.5% (stagnant trade cut to free capital).
+      时间止损: hold >= time_stop_days AND pnl < time_stop_min_pnl (stagnant trade cut).
     Slippage and commission are applied on both entry and exit legs.
     """
     regime_info = compute_regime(df)
-    scores  = compute_signal_scores(df, regime_info=regime_info)
+    scores  = compute_signal_scores(df, regime_info=regime_info, rsi_weight=rsi_weight)
     regimes = regime_info["regimes"]
     closes  = df["Close"].values
+    highs   = df["High"].values
+    lows    = df["Low"].values
     dates   = df.index
     n       = len(df)
 
+    # ATR-based position sizing: 14-day ATR vs 20-day rolling mean ATR
+    _prev_c = np.roll(closes, 1); _prev_c[0] = closes[0]
+    _tr = np.maximum(highs - lows,
+          np.maximum(np.abs(highs - _prev_c), np.abs(lows - _prev_c)))
+    _atr14 = np.full(n, np.nan)
+    for _j in range(13, n):
+        _atr14[_j] = _tr[_j - 13: _j + 1].mean()
+    _atr_mean20 = pd.Series(_atr14).rolling(20, min_periods=10).mean().values
+
+    def _position_size(idx: int) -> float:
+        """Return position multiplier: 0.5 / 1.0 / 1.5 based on ATR ratio."""
+        atr = _atr14[idx]
+        avg = _atr_mean20[idx]
+        if np.isnan(atr) or np.isnan(avg) or avg <= 0:
+            return 1.0
+        ratio = atr / avg
+        if ratio > 1.5:
+            return 0.5
+        if ratio < 0.5:
+            return 1.5
+        return 1.0
+
     trades    = []
     in_trade  = False
-    entry_idx = entry_price = None
+    entry_idx = entry_price = entry_position = None
 
     # Round-trip cost: buy slippage + sell slippage + 2 × commission
     cost      = 2 * slippage + 2 * commission
@@ -496,11 +530,11 @@ def run_backtest(
             # Volatility spike: ATR > 2× 20-day mean ATR blocks entry
             if regime_info["vol_filter"].iloc[i]:
                 continue
-            # UPTREND: go with trend (score >= 2.0); RANGE: standard (score >= 2.5)
-            entry_threshold = 1.5 if cur_reg == "UPTREND" else 2.0
+            entry_threshold = uptrend_thr if cur_reg == "UPTREND" else range_thr
             if scores.iloc[i] >= entry_threshold:
                 entry_idx = i + 1
-                entry_price = float(closes[entry_idx]) * (1 + slippage + commission)
+                entry_price    = float(closes[entry_idx]) * (1 + slippage + commission)
+                entry_position = _position_size(i)   # ATR ratio at signal bar
                 in_trade = True
         else:
             pnl = (float(closes[i]) - entry_price) / entry_price
@@ -510,8 +544,7 @@ def run_backtest(
                 reason = f"止损 -{stop_loss:.0%}"
             elif pnl >= take_profit:
                 reason = f"止盈 +{take_profit:.0%}"
-            elif hold >= 5 and pnl < 0.005:
-                # 时间止损：持仓≥5日且浮盈<0.5%，强制平仓释放资金
+            elif time_stop_enabled and hold >= time_stop_days and pnl < time_stop_min_pnl:
                 reason = "时间止损"
             elif scores.iloc[i] <= -2:
                 reason = "信号卖出"
@@ -528,14 +561,17 @@ def run_backtest(
                 exit_idx = min(i + 1, n - 1)
                 exit_price = float(closes[exit_idx]) * (1 - slippage - commission)
 
-            ret = (exit_price - entry_price) / entry_price
+            raw_ret = (exit_price - entry_price) / entry_price
+            pos_ret = raw_ret * entry_position   # position-weighted return
             trades.append({
-                "entry_date": dates[entry_idx],
-                "exit_date": dates[exit_idx],
+                "entry_date":  dates[entry_idx],
+                "exit_date":   dates[exit_idx],
                 "entry_price": round(float(closes[entry_idx]), 2),
-                "exit_price": round(float(closes[exit_idx]), 2),
-                "return": ret,
-                "days": exit_idx - entry_idx,
+                "exit_price":  round(float(closes[exit_idx]), 2),
+                "return":      pos_ret,
+                "raw_return":  raw_ret,
+                "position":    entry_position,
+                "days":        exit_idx - entry_idx,
                 "exit_reason": reason,
             })
             in_trade = False
@@ -543,14 +579,17 @@ def run_backtest(
     # Close any open position at end
     if in_trade and entry_idx is not None:
         exit_price = float(closes[-1]) * (1 - slippage - commission)
-        ret = (exit_price - entry_price) / entry_price
+        raw_ret = (exit_price - entry_price) / entry_price
+        pos_ret = raw_ret * entry_position
         trades.append({
-            "entry_date": dates[entry_idx],
-            "exit_date": dates[-1],
+            "entry_date":  dates[entry_idx],
+            "exit_date":   dates[-1],
             "entry_price": round(float(closes[entry_idx]), 2),
-            "exit_price": round(float(closes[-1]), 2),
-            "return": ret,
-            "days": n - 1 - entry_idx,
+            "exit_price":  round(float(closes[-1]), 2),
+            "return":      pos_ret,
+            "raw_return":  raw_ret,
+            "position":    entry_position,
+            "days":        n - 1 - entry_idx,
             "exit_reason": "期末清仓",
         })
 
@@ -757,32 +796,35 @@ def build_backtest_chart(equity: pd.Series, df: pd.DataFrame, trades_df: pd.Data
     return fig
 
 
-def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
+def get_signal(
+    df: pd.DataFrame,
+    uptrend_thr: float = 1.5,
+    range_thr: float = 2.0,
+    rsi_weight: int = 2,
+) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
     Scoring rules live exclusively in compute_score(); this function adds the
     regime-threshold layer and the volatility-filter override on top, and
     applies the same 3-day time weighting used by compute_signal_scores.
 
-    Threshold table (applied to weighted_score):
-      UPTREND   – BUY if weighted_score >= 1.5  (go with trend, lower bar)
-      RANGE     – BUY if weighted_score >= 2.0  (standard)
-      DOWNTREND – BUY blocked entirely
-    SELL uses raw_score <= -2 (today's score only — no dampening by history).
+    uptrend_thr / range_thr: BUY thresholds, adapted by Beta mode.
+    rsi_weight: RSI score magnitude (2 standard, 1 for low-beta 稳健模式).
+    SELL uses raw_score <= -2 (today's raw score only).
     """
     regime_info = compute_regime(df)
     regime      = regime_info["current"]
 
     # Today's raw score + human-readable reasons
-    raw_score, reasons = compute_score(df, -1, regime_info)
+    raw_score, reasons = compute_score(df, -1, regime_info, rsi_weight=rsi_weight)
     _n = len(df)
 
     # 3-day time-weighted score — mirrors compute_signal_scores weighting exactly
     # compute_score(df, -k, ...) uses df.iloc[-k] and df.iloc[-k-1],
     # so -2 requires n>=3, -3 requires n>=4.
     _s0 = float(raw_score)
-    _s1 = float(compute_score(df, -2, regime_info)[0]) if _n >= 3 else 0.0
-    _s2 = float(compute_score(df, -3, regime_info)[0]) if _n >= 4 else 0.0
+    _s1 = float(compute_score(df, -2, regime_info, rsi_weight=rsi_weight)[0]) if _n >= 3 else 0.0
+    _s2 = float(compute_score(df, -3, regime_info, rsi_weight=rsi_weight)[0]) if _n >= 4 else 0.0
 
     if _n >= 4:
         weighted_score = 0.5*_s0 + 0.3*_s1 + 0.2*_s2
@@ -791,11 +833,11 @@ def get_signal(df: pd.DataFrame) -> tuple[str, list[str], dict]:
     else:
         weighted_score = _s0
 
-    # Regime-adjusted thresholds
+    # Regime-adjusted thresholds (caller-supplied, so Beta mode is already baked in)
     if regime == "UPTREND":
-        buy_threshold = 1.5
+        buy_threshold = uptrend_thr
     elif regime == "RANGE":
-        buy_threshold = 2.0
+        buy_threshold = range_thr
     else:                       # DOWNTREND — BUY completely forbidden
         buy_threshold = None
 
@@ -2285,6 +2327,12 @@ with st.sidebar:
     take_profit_pct = st.slider("止盈比例", min_value=1, max_value=20, value=5, step=1, format="%d%%")
     slippage_pct = st.slider("滑点", min_value=0.0, max_value=1.0, value=0.1, step=0.05, format="%.2f%%")
     commission_pct = st.slider("手续费（单边）", min_value=0.0, max_value=0.5, value=0.1, step=0.05, format="%.2f%%")
+    st.markdown("**时间止损**")
+    time_stop_enabled = st.toggle("启用时间止损", value=True)
+    time_stop_days = st.slider("时间止损天数", min_value=3, max_value=10, value=5, step=1,
+                               disabled=not time_stop_enabled)
+    time_stop_min_pnl_pct = st.slider("最低盈利要求", min_value=0.0, max_value=2.0, value=0.5,
+                                      step=0.1, format="%.1f%%", disabled=not time_stop_enabled)
 
     run_btn = st.button("开始分析")
 
@@ -2546,8 +2594,139 @@ for col, lbl, val, badge, color in risk_cards:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+# ── Prepare ML features & pre-compute OOS predictions (used by signal + backtest) ──
+# df["Close"] is already split/dividend-adjusted (fetch_data uses auto_adjust=True),
+# so all price-based features below are free from stock-split contamination.
+_close_arr = df["Close"].values.astype(float)
+_high_arr  = df["High"].values.astype(float)
+_low_arr   = df["Low"].values.astype(float)
+_vol_arr   = df["Volume"].values.astype(float)
+_n_ml      = len(_close_arr)
+_rsi_arr   = df["RSI"].values.astype(float)
+_macd_arr  = df["MACD"].values.astype(float)
+_macd_h_arr = df["MACD_Hist"].values.astype(float)
+_bb_u_arr  = df["BB_Upper"].values.astype(float)
+_bb_l_arr  = df["BB_Lower"].values.astype(float)
+_ma20_arr  = df["MA20"].values.astype(float)
+_ma50_arr  = df["MA50"].values.astype(float)
+
+_lc = np.log(np.where(_close_arr > 0, _close_arr, 1.0))
+
+# RSI & change
+_rsi_n    = _rsi_arr / 100
+_rsi_chg  = np.full(_n_ml, np.nan); _rsi_chg[1:] = _rsi_arr[1:] - _rsi_arr[:-1]
+
+# MACD (price-normalized) & hist change
+_macd_n   = np.where(_close_arr > 0, _macd_arr / _close_arr, 0.0)
+_macd_h_n = np.where(_close_arr > 0, _macd_h_arr / _close_arr, 0.0)
+_macd_h_chg = np.full(_n_ml, np.nan); _macd_h_chg[1:] = _macd_h_arr[1:] - _macd_h_arr[:-1]
+
+# Bollinger %B
+_bb_width = np.where(_bb_u_arr - _bb_l_arr > 0, _bb_u_arr - _bb_l_arr, 1.0)
+_bb_pctb  = (_close_arr - _bb_l_arr) / _bb_width
+
+# ATR_ratio: 14-day rolling mean of (TR / Close), fully dimensionless
+_prev_close = np.roll(_close_arr, 1)
+_prev_close[0] = _close_arr[0]
+_tr_ratio = np.maximum(
+    (_high_arr - _low_arr) / np.where(_close_arr > 0, _close_arr, 1.0),
+    np.maximum(
+        np.abs(_high_arr - _prev_close) / np.where(_close_arr > 0, _close_arr, 1.0),
+        np.abs(_low_arr  - _prev_close) / np.where(_close_arr > 0, _close_arr, 1.0),
+    )
+)
+_atr_n = np.full(_n_ml, np.nan)
+for _i in range(13, _n_ml):
+    _atr_n[_i] = _tr_ratio[_i - 13: _i + 1].mean()
+
+# MA deviation (%, not ratio)
+_ma20_dev = np.where(_close_arr > 0, (_close_arr - _ma20_arr) / _close_arr, np.nan)
+_ma50_dev = np.where(_close_arr > 0, (_close_arr - _ma50_arr) / _close_arr, np.nan)
+
+# Momentum: 1/3/5/10/20-day log returns
+def _logret(arr, lag):
+    r = np.full(_n_ml, np.nan)
+    if _n_ml > lag:
+        r[lag:] = arr[lag:] - arr[:-lag]
+    return r
+
+_ret1  = _logret(_lc, 1)
+_ret3  = _logret(_lc, 3)
+_ret5  = _logret(_lc, 5)
+_ret10 = _logret(_lc, 10)
+_ret20 = _logret(_lc, 20)
+
+# Volume change: 1-day and 5-day log change
+_lv = np.log(np.where(_vol_arr > 0, _vol_arr, 1.0))
+_vol_chg1 = _logret(_lv, 1)
+_vol_chg5 = _logret(_lv, 5)
+
+# VWAP deviation: 20-day rolling VWAP vs close
+_cv = _close_arr * _vol_arr
+_vwap20 = np.full(_n_ml, np.nan)
+for _i in range(19, _n_ml):
+    _sv = _vol_arr[_i - 19: _i + 1].sum()
+    _vwap20[_i] = _cv[_i - 19: _i + 1].sum() / _sv if _sv > 0 else _close_arr[_i]
+_vwap_dev = np.where(_close_arr > 0, (_close_arr - _vwap20) / _close_arr, np.nan)
+
+# Stack all 17 features
+_ml_feat = np.column_stack([
+    _rsi_n, _rsi_chg, _macd_n, _macd_h_n, _macd_h_chg,
+    _bb_pctb, _atr_n, _ma20_dev, _ma50_dev,
+    _ret1, _ret3, _ret5, _ret10, _ret20,
+    _vol_chg1, _vol_chg5, _vwap_dev,
+])
+
+# Rolling Z-score normalization (window=20, min 5 obs) — removes non-stationarity
+_zwin = 20
+_ml_feat_df_z = pd.DataFrame(_ml_feat)
+_roll_mean_z  = _ml_feat_df_z.rolling(_zwin, min_periods=5).mean().values
+_roll_std_z   = _ml_feat_df_z.rolling(_zwin, min_periods=5).std().values
+_roll_std_z   = np.where(_roll_std_z < 1e-9, np.nan, _roll_std_z)
+_ml_feat = np.where(
+    np.isnan(_ml_feat) | np.isnan(_roll_mean_z) | np.isnan(_roll_std_z),
+    np.nan,
+    (_ml_feat - _roll_mean_z) / _roll_std_z,
+)
+
+_ml_mask  = ~np.any(np.isnan(_ml_feat) | np.isinf(_ml_feat), axis=1)
+_ml_feat  = _ml_feat[_ml_mask]
+_ml_close = _close_arr[_ml_mask]
+_ml_dates = df.index[_ml_mask]
+
+# ── Beta adaptive strategy ────────────────────────────────────────────────────
+_beta_raw = info.get("beta")
+try:
+    _beta_val: float | None = float(_beta_raw) if _beta_raw is not None else None
+except (TypeError, ValueError):
+    _beta_val = None
+
+if _beta_val is not None and _beta_val < 0.8:
+    _beta_mode    = "稳健模式"
+    _beta_mode_c  = C["accent2"]   # calm color for low-vol
+    _uptrend_thr  = 1.0
+    _range_thr    = 1.5
+    _rsi_weight   = 1
+elif _beta_val is not None and _beta_val > 1.2:
+    _beta_mode    = "动量模式"
+    _beta_mode_c  = C["up"]
+    _uptrend_thr  = 1.5
+    _range_thr    = 2.0
+    _rsi_weight   = 2
+else:
+    _beta_mode    = None           # no badge shown for mid-range beta
+    _beta_mode_c  = C["muted"]
+    _uptrend_thr  = 1.5
+    _range_thr    = 2.0
+    _rsi_weight   = 2
+
 # ── Signal + Fear & Greed ─────────────────────────────────────────────────────
-signal, reasons, regime_info = get_signal(df)
+signal, reasons, regime_info = get_signal(
+    df,
+    uptrend_thr=_uptrend_thr,
+    range_thr=_range_thr,
+    rsi_weight=_rsi_weight,
+)
 fg = fetch_fear_greed()
 
 signal_styles = {
@@ -2571,6 +2750,25 @@ _w_score    = regime_info["weighted_score"]
 _threshold  = regime_info["buy_threshold"]
 _thr_txt    = "禁止买入" if _threshold is None else f"{_threshold:.1f}"
 _score_col  = C["up"] if _w_score >= (_threshold or 999) else C["warn"] if _w_score > 0 else C["down"]
+
+# Beta mode badge HTML (empty string when beta is in mid range)
+_beta_val_txt = f"{_beta_val:.2f}" if _beta_val is not None else "N/A"
+_c_dim = C["dim"]
+if _beta_mode:
+    _beta_badge_html = (
+        f"<div style='margin-top:7px; display:inline-flex; align-items:center; gap:5px;"
+        f"  padding:3px 8px; border-radius:12px;"
+        f"  background:{_beta_mode_c}18; border:1px solid {_beta_mode_c}50;'>"
+        f"  <span style='font-size:11px; font-weight:700; color:{_beta_mode_c};'>{_beta_mode}</span>"
+        f"  <span style='font-size:10px; color:{_c_dim};'>β={_beta_val_txt}</span>"
+        f"</div>"
+    )
+else:
+    _beta_badge_html = (
+        f"<div style='margin-top:7px; font-size:10px; color:{_c_dim};'>"
+        f"β={_beta_val_txt}"
+        f"</div>"
+    )
 
 col_sig, col_reasons, col_fg = st.columns([1, 2, 1])
 with col_sig:
@@ -2600,6 +2798,7 @@ with col_sig:
                        font-weight:600;'>{_thr_txt}</span>
         </span>
       </div>
+      {_beta_badge_html}
     </div>
     """, unsafe_allow_html=True)
 
@@ -2663,6 +2862,12 @@ with st.spinner("回测计算中..."):
         take_profit=take_profit_pct / 100,
         slippage=slippage_pct / 100,
         commission=commission_pct / 100,
+        time_stop_enabled=time_stop_enabled,
+        time_stop_days=time_stop_days,
+        time_stop_min_pnl=time_stop_min_pnl_pct / 100,
+        uptrend_thr=_uptrend_thr,
+        range_thr=_range_thr,
+        rsi_weight=_rsi_weight,
     )
 
 if bt["metrics"] is None:
@@ -2783,18 +2988,30 @@ else:
 
     with st.expander("查看交易记录"):
         tdf = bt["trades"].copy()
-        tdf["return"] = tdf["return"].map(lambda x: f"{x:+.2%}")
-        tdf.columns = ["买入日期", "卖出日期", "买入价", "卖出价", "收益率", "持仓天数", "退出原因"]
+        tdf["return"]   = tdf["return"].map(lambda x: f"{x:+.2%}")
+        tdf["position"] = tdf["position"].map(lambda x: f"{x:.0%}")
+        tdf = tdf[["entry_date", "exit_date", "entry_price", "exit_price",
+                   "return", "position", "days", "exit_reason"]]
+        tdf.columns = ["买入日期", "卖出日期", "买入价", "卖出价", "收益率", "仓位", "持仓天数", "退出原因"]
 
         def _reason_style(v):
             if not isinstance(v, str):
                 return ""
             if v == "时间止损":
-                return "color:#f59e0b;font-weight:600"   # 琥珀色：时间止损
+                return "color:#f59e0b;font-weight:600"
             if v.startswith("止损"):
-                return "color:#f43f5e;font-weight:600"   # 红色：止损
+                return "color:#f43f5e;font-weight:600"
             if v.startswith("止盈"):
-                return "color:#10b981;font-weight:600"   # 绿色：止盈
+                return "color:#10b981;font-weight:600"
+            return ""
+
+        def _pos_style(v):
+            if not isinstance(v, str):
+                return ""
+            if v == "150%":
+                return "color:#10b981;font-weight:600"
+            if v == "50%":
+                return "color:#f59e0b;font-weight:600"
             return ""
 
         st.dataframe(
@@ -2804,7 +3021,8 @@ else:
                              ("color:#f43f5e" if isinstance(v, str) and v.startswith("-") else ""),
                    subset=["收益率"],
                )
-               .map(_reason_style, subset=["退出原因"]),
+               .map(_reason_style, subset=["退出原因"])
+               .map(_pos_style, subset=["仓位"]),
             width="stretch",
         )
 
@@ -2920,106 +3138,6 @@ st.markdown("---")
 _daily_ret = df["Close"].pct_change().dropna()
 _mu  = round(float(_daily_ret.mean()), 8)
 _sig = round(float(_daily_ret.std()),  8)
-
-# ── Prepare ML features (needed before tabs so cache key is stable) ───────────
-# df["Close"] is already split/dividend-adjusted (fetch_data uses auto_adjust=True),
-# so all price-based features below are free from stock-split contamination.
-_close_arr = df["Close"].values.astype(float)
-_high_arr  = df["High"].values.astype(float)
-_low_arr   = df["Low"].values.astype(float)
-_vol_arr   = df["Volume"].values.astype(float)
-_n_ml      = len(_close_arr)
-_rsi_arr   = df["RSI"].values.astype(float)
-_macd_arr  = df["MACD"].values.astype(float)
-_macd_h_arr = df["MACD_Hist"].values.astype(float)
-_bb_u_arr  = df["BB_Upper"].values.astype(float)
-_bb_l_arr  = df["BB_Lower"].values.astype(float)
-_ma20_arr  = df["MA20"].values.astype(float)
-_ma50_arr  = df["MA50"].values.astype(float)
-
-_lc = np.log(np.where(_close_arr > 0, _close_arr, 1.0))
-
-# RSI & change
-_rsi_n    = _rsi_arr / 100
-_rsi_chg  = np.full(_n_ml, np.nan); _rsi_chg[1:] = _rsi_arr[1:] - _rsi_arr[:-1]
-
-# MACD (price-normalized) & hist change
-_macd_n   = np.where(_close_arr > 0, _macd_arr / _close_arr, 0.0)
-_macd_h_n = np.where(_close_arr > 0, _macd_h_arr / _close_arr, 0.0)
-_macd_h_chg = np.full(_n_ml, np.nan); _macd_h_chg[1:] = _macd_h_arr[1:] - _macd_h_arr[:-1]
-
-# Bollinger %B
-_bb_width = np.where(_bb_u_arr - _bb_l_arr > 0, _bb_u_arr - _bb_l_arr, 1.0)
-_bb_pctb  = (_close_arr - _bb_l_arr) / _bb_width
-
-# ATR_ratio: 14-day rolling mean of (TR / Close), fully dimensionless
-_prev_close = np.roll(_close_arr, 1)
-_prev_close[0] = _close_arr[0]
-_tr_ratio = np.maximum(
-    (_high_arr - _low_arr) / np.where(_close_arr > 0, _close_arr, 1.0),
-    np.maximum(
-        np.abs(_high_arr - _prev_close) / np.where(_close_arr > 0, _close_arr, 1.0),
-        np.abs(_low_arr  - _prev_close) / np.where(_close_arr > 0, _close_arr, 1.0),
-    )
-)
-_atr_n = np.full(_n_ml, np.nan)
-for _i in range(13, _n_ml):
-    _atr_n[_i] = _tr_ratio[_i - 13: _i + 1].mean()
-
-# MA deviation (%, not ratio)
-_ma20_dev = np.where(_close_arr > 0, (_close_arr - _ma20_arr) / _close_arr, np.nan)
-_ma50_dev = np.where(_close_arr > 0, (_close_arr - _ma50_arr) / _close_arr, np.nan)
-
-# Momentum: 1/3/5/10/20-day log returns
-def _logret(arr, lag):
-    r = np.full(_n_ml, np.nan)
-    if _n_ml > lag:
-        r[lag:] = arr[lag:] - arr[:-lag]
-    return r
-
-_ret1  = _logret(_lc, 1)
-_ret3  = _logret(_lc, 3)
-_ret5  = _logret(_lc, 5)
-_ret10 = _logret(_lc, 10)
-_ret20 = _logret(_lc, 20)
-
-# Volume change: 1-day and 5-day log change
-_lv = np.log(np.where(_vol_arr > 0, _vol_arr, 1.0))
-_vol_chg1 = _logret(_lv, 1)
-_vol_chg5 = _logret(_lv, 5)
-
-# VWAP deviation: 20-day rolling VWAP vs close
-_cv = _close_arr * _vol_arr
-_vwap20 = np.full(_n_ml, np.nan)
-for _i in range(19, _n_ml):
-    _sv = _vol_arr[_i - 19: _i + 1].sum()
-    _vwap20[_i] = _cv[_i - 19: _i + 1].sum() / _sv if _sv > 0 else _close_arr[_i]
-_vwap_dev = np.where(_close_arr > 0, (_close_arr - _vwap20) / _close_arr, np.nan)
-
-# Stack all 17 features
-_ml_feat = np.column_stack([
-    _rsi_n, _rsi_chg, _macd_n, _macd_h_n, _macd_h_chg,
-    _bb_pctb, _atr_n, _ma20_dev, _ma50_dev,
-    _ret1, _ret3, _ret5, _ret10, _ret20,
-    _vol_chg1, _vol_chg5, _vwap_dev,
-])
-
-# Rolling Z-score normalization (window=20, min 5 obs) — removes non-stationarity
-_zwin = 20
-_ml_feat_df_z = pd.DataFrame(_ml_feat)
-_roll_mean_z  = _ml_feat_df_z.rolling(_zwin, min_periods=5).mean().values
-_roll_std_z   = _ml_feat_df_z.rolling(_zwin, min_periods=5).std().values
-_roll_std_z   = np.where(_roll_std_z < 1e-9, np.nan, _roll_std_z)
-_ml_feat = np.where(
-    np.isnan(_ml_feat) | np.isnan(_roll_mean_z) | np.isnan(_roll_std_z),
-    np.nan,
-    (_ml_feat - _roll_mean_z) / _roll_std_z,
-)
-
-_ml_mask  = ~np.any(np.isnan(_ml_feat) | np.isinf(_ml_feat), axis=1)
-_ml_feat  = _ml_feat[_ml_mask]
-_ml_close = _close_arr[_ml_mask]
-_ml_dates = df.index[_ml_mask]
 
 mc_tab, garch_tab, ml_tab = st.tabs([
     "蒙特卡洛模拟（30天·1000条路径）",
