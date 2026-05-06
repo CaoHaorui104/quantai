@@ -2026,13 +2026,13 @@ def build_chart(df: pd.DataFrame, ticker: str, C: dict) -> go.Figure:
 
 @st.cache_data(ttl=86400)  # daily cache: same ticker + same day tunes only once
 def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
-                      ticker: str = "", today_str: str = "") -> dict:
+                      ticker: str = "", today_str: str = "",
+                      tp: float = 0.05, sl: float = 0.03) -> dict:
     try:
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.linear_model import Ridge
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import TimeSeriesSplit
-        from sklearn.multioutput import MultiOutputRegressor
         import xgboost as xgb
         import lightgbm as lgb
     except ImportError as e:
@@ -2041,7 +2041,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
     HORIZON  = 5
     MIN_ROWS = 100
     N_SPLITS = 5
-    EMBARGO  = 5   # trading-day gap between train end and test start (prevents lookahead)
+    EMBARGO  = 5
 
     try:
         X      = np.array(feat_rows)
@@ -2050,15 +2050,33 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         if n < MIN_ROWS + HORIZON:
             return {"error": "insufficient_data"}
 
-        # Multi-horizon targets
+        # ── Triple-barrier labels ─────────────────────────────────────────────
+        # For each bar: scan forward up to HORIZON days.
+        # Hit +tp first → label 1; hit -sl first → label -1; neither → label 0.
         valid_n = n - HORIZON
         X_v = X[:valid_n]
-        y   = np.zeros((valid_n, HORIZON))
-        for h in range(1, HORIZON + 1):
-            y[:, h - 1] = (closes[h: valid_n + h] - closes[:valid_n]) / closes[:valid_n]
-        y5 = y[:, -1]   # 5-day return, used for tuning
+        labels = np.zeros(valid_n, dtype=int)
+        for idx in range(valid_n):
+            entry = closes[idx]
+            for h in range(1, HORIZON + 1):
+                ret = (closes[idx + h] - entry) / entry
+                if ret >= tp:
+                    labels[idx] = 2   # 止盈
+                    break
+                if ret <= -sl:
+                    labels[idx] = 0   # 止损
+                    break
+            # default 1 = 无信号 (already set by np.zeros → need explicit set)
+            else:
+                labels[idx] = 1
 
-        # Feature names — defined early so DataFrames carry consistent column names
+        # Time-decay sample weights: exp(-lambda * age_in_days), lambda=0.005
+        _DECAY   = 0.005
+        _dates_v = np.array([pd.Timestamp(d) for d in list(dates_tuple)[:valid_n]])
+        _age     = np.array([(_dates_v[-1] - d).days for d in _dates_v], dtype=float)
+        weights  = np.exp(-_DECAY * _age)   # shape (valid_n,), newest=1.0
+
+        # Feature names
         _feat_names = [
             "RSI", "RSI变化", "MACD", "MACD柱", "MACD柱变化",
             "布林%B", "ATR", "MA20偏差", "MA50偏差",
@@ -2071,40 +2089,32 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
 
         # ── Embargo helper ────────────────────────────────────────────────────
         def _embargoed_splits(cv, X, embargo=EMBARGO):
-            """
-            Wrap any CV splitter: drop the last `embargo` rows from each
-            training set so there is a dead-zone between train end and test
-            start.  This prevents feature-window bleed (e.g. a 5-day rolling
-            feature computed near the fold boundary can leak future returns).
-            Folds where the embargoed train set shrinks below 20 rows are skipped.
-            """
             for tr, te in cv.split(X):
-                cutoff  = te[0] - embargo          # first valid train index
-                tr_emb  = tr[tr < cutoff]
+                cutoff = te[0] - embargo
+                tr_emb = tr[tr < cutoff]
                 if len(tr_emb) >= 20:
                     yield tr_emb, te
 
-        # ── Helpers shared by inner CV and walk-forward ──────────────────────
+        # ── Inner-CV classification accuracy ──────────────────────────────────
         inner_cv = TimeSeriesSplit(n_splits=3)
         rng = np.random.default_rng(42)
 
-        def _cv_dir_acc(estimator, X_raw, ys, cv, as_df=False):
+        def _cv_acc(estimator, X_raw, ys, cv, as_df=False, sw=None):
             scores = []
             for tr, te in _embargoed_splits(cv, X_raw):
                 if len(tr) < 20:
                     continue
-                sc = StandardScaler()                       # per-inner-fold scaler
+                sc = StandardScaler()
                 Xtr_s = sc.fit_transform(X_raw[tr])
                 Xte_s = sc.transform(X_raw[te])
                 Xtr_ = _df(Xtr_s) if as_df else Xtr_s
                 Xte_ = _df(Xte_s) if as_df else Xte_s
-                estimator.fit(Xtr_, ys[tr])
-                scores.append(float(np.mean(
-                    np.sign(estimator.predict(Xte_)) == np.sign(ys[te])
-                )))
-            return float(np.mean(scores)) if scores else 0.5
+                _fit_kw = {"sample_weight": sw[tr]} if sw is not None else {}
+                estimator.fit(Xtr_, ys[tr], **_fit_kw)
+                scores.append(float(np.mean(estimator.predict(Xte_) == ys[te])))
+            return float(np.mean(scores)) if scores else 0.0
 
-        # Search-space definitions (shared by per-fold and global tuning)
+        # Search spaces
         _xgb_space = {
             "n_estimators":  [100, 150, 200],
             "max_depth":     [3, 4, 5],
@@ -2117,251 +2127,269 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             "learning_rate": [0.05, 0.10, 0.15],
         }
 
-        def _tune_fold(X_raw, ys):
-            """Return best params for all four models using only X_raw/ys."""
-            ra = max(
+        def _tune_fold(X_raw, ys, sw=None):
+            """Return best (C, rf_p, xgb_p, lgb_p) using only X_raw/ys."""
+            best_C = max(
                 [0.01, 0.1, 1.0, 10.0, 100.0],
-                key=lambda a: _cv_dir_acc(Ridge(alpha=a), X_raw, ys, inner_cv),
+                key=lambda c: _cv_acc(
+                    LogisticRegression(C=c, max_iter=500, random_state=42,
+                                       solver="lbfgs"),
+                    X_raw, ys, inner_cv, sw=sw,
+                ),
             )
             rf_p = {"n_estimators": 100, "max_depth": 5, "min_samples_leaf": 4}
             _bs = -1.0
             for n_est in [100, 150]:
                 for depth in [4, 6]:
                     p = {"n_estimators": n_est, "max_depth": depth, "min_samples_leaf": 4}
-                    s = _cv_dir_acc(RandomForestRegressor(**p, random_state=42, n_jobs=1), X_raw, ys, inner_cv)
+                    s = _cv_acc(RandomForestClassifier(**p, random_state=42, n_jobs=1),
+                                X_raw, ys, inner_cv, sw=sw)
                     if s > _bs:
                         _bs, rf_p = s, p
             xgb_p = {"n_estimators": 150, "max_depth": 4, "learning_rate": 0.10, "subsample": 0.8}
             _bs = -1.0
             for _ in range(8):
                 p = {k: v[int(rng.integers(len(v)))] for k, v in _xgb_space.items()}
-                s = _cv_dir_acc(xgb.XGBRegressor(**p, random_state=42, verbosity=0, n_jobs=1), X_raw, ys, inner_cv)
+                s = _cv_acc(xgb.XGBClassifier(**p, random_state=42, verbosity=0,
+                                               n_jobs=1, eval_metric="mlogloss"),
+                            X_raw, ys, inner_cv, sw=sw)
                 if s > _bs:
                     _bs, xgb_p = s, p
             lgb_p = {"n_estimators": 150, "num_leaves": 31, "learning_rate": 0.10}
             _bs = -1.0
             for _ in range(8):
                 p = {k: v[int(rng.integers(len(v)))] for k, v in _lgb_space.items()}
-                s = _cv_dir_acc(lgb.LGBMRegressor(**p, random_state=42, verbose=-1, n_jobs=1), X_raw, ys, inner_cv, as_df=True)
+                s = _cv_acc(lgb.LGBMClassifier(**p, random_state=42, verbose=-1, n_jobs=1),
+                            X_raw, ys, inner_cv, as_df=True, sw=sw)
                 if s > _bs:
                     _bs, lgb_p = s, p
-            return ra, rf_p, xgb_p, lgb_p
+            return best_C, rf_p, xgb_p, lgb_p
 
-        # ── Walk-forward evaluation — per-fold tuning + evaluation ───────────
-        # Each outer fold tunes hyperparameters ONLY on that fold's training
-        # data (via inner_cv), then evaluates on its embargoed test set.
-        # This eliminates look-ahead bias from global hyperparameter selection.
+        # ── Walk-forward evaluation ───────────────────────────────────────────
         tscv = TimeSeriesSplit(n_splits=N_SPLITS)
         outer_splits = list(_embargoed_splits(tscv, X_v))
 
         fold_accs = {m: [] for m in
-                     ["Ridge", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]}
+                     ["LogReg", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]}
 
-        last_fold_params = None   # track for OOS display
+        last_fold_params = None
         for fold_tr, fold_te in outer_splits:
             if len(fold_tr) < 30 or len(fold_te) < 30:
                 continue
 
-            # Tune on this fold's training data only
-            f_ridge, f_rf, f_xgb, f_lgb = _tune_fold(X_v[fold_tr], y5[fold_tr])
+            w_fold = weights[fold_tr]
+            f_C, f_rf, f_xgb, f_lgb = _tune_fold(X_v[fold_tr], labels[fold_tr], sw=w_fold)
 
-            sc = StandardScaler()                            # per-outer-fold scaler
+            sc = StandardScaler()
             Xtr = sc.fit_transform(X_v[fold_tr])
             Xte = sc.transform(X_v[fold_te])
-            y5_tr, y5_te = y5[fold_tr], y5[fold_te]
-
+            lbl_tr, lbl_te = labels[fold_tr], labels[fold_te]
             Xtr_df, Xte_df = _df(Xtr), _df(Xte)
-            preds = {}
-            preds["Ridge"] = Ridge(alpha=f_ridge).fit(Xtr, y5_tr).predict(Xte)
-            preds["RandomForest"] = RandomForestRegressor(
-                **f_rf, random_state=42, n_jobs=1).fit(Xtr, y5_tr).predict(Xte)
-            preds["XGBoost"] = xgb.XGBRegressor(
-                **f_xgb, random_state=42, verbosity=0, n_jobs=1).fit(Xtr, y5_tr).predict(Xte)
-            preds["LightGBM"] = lgb.LGBMRegressor(
-                **f_lgb, random_state=42, verbose=-1, n_jobs=1).fit(Xtr_df, y5_tr).predict(Xte_df)
-            preds["Ensemble"] = sum(preds.values()) / 4
 
+            clfs = {
+                "LogReg":       LogisticRegression(C=f_C, max_iter=500, random_state=42,
+                                                   solver="lbfgs"),
+                "RandomForest": RandomForestClassifier(**f_rf, random_state=42, n_jobs=1),
+                "XGBoost":      xgb.XGBClassifier(**f_xgb, random_state=42, verbosity=0,
+                                                   n_jobs=1, eval_metric="mlogloss"),
+                "LightGBM":     lgb.LGBMClassifier(**f_lgb, random_state=42, verbose=-1, n_jobs=1),
+            }
+            preds = {}
+            for name, clf in clfs.items():
+                Xtr_ = Xtr_df if name == "LightGBM" else Xtr
+                Xte_ = Xte_df if name == "LightGBM" else Xte
+                clf.fit(Xtr_, lbl_tr, sample_weight=w_fold)
+                preds[name] = clf.predict(Xte_)
+            # Majority-vote ensemble
+            _ens_arr = np.array(list(preds.values()))
+            preds["Ensemble"] = np.array([
+                max(set(col.tolist()), key=col.tolist().count)
+                for col in _ens_arr.T
+            ])
             for name, p in preds.items():
-                fold_accs[name].append(
-                    float(np.mean(np.sign(p) == np.sign(y5_te)))
-                )
-            last_fold_params = {"ridge_alpha": f_ridge, "rf": f_rf, "xgb": f_xgb, "lgb": f_lgb,
+                fold_accs[name].append(float(np.mean(p == lbl_te)))
+
+            last_fold_params = {"C": f_C, "rf": f_rf, "xgb": f_xgb, "lgb": f_lgb,
                                  "tr": fold_tr, "te": fold_te}
 
         model_avg_acc = {k: float(np.mean(v)) if v else 0.0
                          for k, v in fold_accs.items()}
 
-        # ── Global tuning for final retrain (uses all X_v, not OOS) ──────────
-        best_ridge_alpha, best_rf_p, best_xgb_p, best_lgb_p = _tune_fold(X_v, y5)
+        # ── Global tuning + final retrain on all data ─────────────────────────
+        best_C, best_rf_p, best_xgb_p, best_lgb_p = _tune_fold(X_v, labels, sw=weights)
 
-        # ── Final retrain on all data ─────────────────────────────────────────
-        scaler2   = StandardScaler()
-        X_all_s   = scaler2.fit_transform(X_v)
-        x_now     = scaler2.transform(X_v[[-1]])
-        X_all_df  = _df(X_all_s)
-        x_now_df  = _df(x_now)
+        scaler2  = StandardScaler()
+        X_all_s  = scaler2.fit_transform(X_v)
+        x_now    = scaler2.transform(X_v[[-1]])
+        X_all_df = _df(X_all_s)
+        x_now_df = _df(x_now)
 
-        ridge_f = Ridge(alpha=best_ridge_alpha).fit(X_all_s, y)
-        rf_f    = RandomForestRegressor(**best_rf_p, random_state=42, n_jobs=1).fit(X_all_s, y)
-        xgb_f   = MultiOutputRegressor(
-            xgb.XGBRegressor(**best_xgb_p, random_state=42, verbosity=0, n_jobs=1)
-        ).fit(X_all_s, y)
-        lgb_f   = MultiOutputRegressor(
-            lgb.LGBMRegressor(**best_lgb_p, random_state=42, verbose=-1, n_jobs=1)
-        ).fit(X_all_df, y)
+        lr_f  = LogisticRegression(C=best_C, max_iter=500, random_state=42,
+                                   solver="lbfgs").fit(X_all_s, labels, sample_weight=weights)
+        rf_f  = RandomForestClassifier(**best_rf_p, random_state=42, n_jobs=1).fit(
+                                   X_all_s, labels, sample_weight=weights)
+        xgb_f = xgb.XGBClassifier(**best_xgb_p, random_state=42, verbosity=0,
+                                   n_jobs=1, eval_metric="mlogloss").fit(
+                                   X_all_s, labels, sample_weight=weights)
+        lgb_f = lgb.LGBMClassifier(**best_lgb_p, random_state=42,
+                                   verbose=-1, n_jobs=1).fit(
+                                   X_all_df, labels, sample_weight=weights)
 
-        lr_mean  = ridge_f.predict(x_now)[0]
-        rf_mean  = rf_f.predict(x_now)[0]
-        xgb_mean = xgb_f.predict(x_now)[0]
-        lgb_mean = lgb_f.predict(x_now_df)[0]
-        ens_mean = (lr_mean + rf_mean + xgb_mean + lgb_mean) / 4
+        # Extract P(止盈)=P(1), P(止损)=P(-1) for each classifier
+        def _extract_proba(clf, x):
+            p = clf.predict_proba(x)[0]
+            cls = list(clf.classes_)
+            p_sl      = float(p[cls.index(0)]) if 0 in cls else 0.0
+            p_neutral = float(p[cls.index(1)]) if 1 in cls else 0.0
+            p_tp      = float(p[cls.index(2)]) if 2 in cls else 0.0
+            return p_sl, p_neutral, p_tp
 
-        # CI from RF tree diversity
-        tree_preds = np.array([t.predict(x_now)[0] for t in rf_f.estimators_])
-        ens_std    = tree_preds.std(axis=0)
+        lr_sl,  lr_neutral,  lr_tp  = _extract_proba(lr_f,  x_now)
+        rf_sl,  rf_neutral,  rf_tp  = _extract_proba(rf_f,  x_now)
+        xgb_sl, xgb_neutral, xgb_tp = _extract_proba(xgb_f, x_now)
+        lgb_sl, lgb_neutral, lgb_tp = _extract_proba(lgb_f, x_now_df)
 
-        cur_close  = float(closes[-1])
-        ens_prices = (cur_close * (1 + ens_mean)).tolist()
-        lr_prices  = (cur_close * (1 + lr_mean)).tolist()
-        rf_upper   = (cur_close * (1 + ens_mean + 1.96 * ens_std)).tolist()
-        rf_lower   = (cur_close * (1 + ens_mean - 1.96 * ens_std)).tolist()
+        ens_tp      = (lr_tp  + rf_tp  + xgb_tp  + lgb_tp)  / 4
+        ens_sl      = (lr_sl  + rf_sl  + xgb_sl  + lgb_sl)  / 4
+        ens_neutral = (lr_neutral + rf_neutral + xgb_neutral + lgb_neutral) / 4
+
+        model_probs = {
+            "LogReg":       {"tp": lr_tp,  "sl": lr_sl,  "neutral": lr_neutral},
+            "RandomForest": {"tp": rf_tp,  "sl": rf_sl,  "neutral": rf_neutral},
+            "XGBoost":      {"tp": xgb_tp, "sl": xgb_sl, "neutral": xgb_neutral},
+            "LightGBM":     {"tp": lgb_tp, "sl": lgb_sl, "neutral": lgb_neutral},
+            "Ensemble":     {"tp": ens_tp, "sl": ens_sl, "neutral": ens_neutral},
+        }
 
         # Feature importance from RF
         importance = rf_f.feature_importances_[:_n_feats].tolist()
         feat_names = _cols
 
-        # OOS series from last fold — use that fold's own tuned params
+        # ── OOS from last fold — predict_proba on test set ────────────────────
         last_tr = last_fold_params["tr"] if last_fold_params else outer_splits[-1][0]
         last_te = last_fold_params["te"] if last_fold_params else outer_splits[-1][1]
-        _lf_ridge = last_fold_params["ridge_alpha"] if last_fold_params else best_ridge_alpha
-        _lf_rf    = last_fold_params["rf"]  if last_fold_params else best_rf_p
-        _lf_xgb   = last_fold_params["xgb"] if last_fold_params else best_xgb_p
-        _lf_lgb   = last_fold_params["lgb"] if last_fold_params else best_lgb_p
+        _lf_C   = last_fold_params["C"]   if last_fold_params else best_C
+        _lf_rf  = last_fold_params["rf"]  if last_fold_params else best_rf_p
+        _lf_xgb = last_fold_params["xgb"] if last_fold_params else best_xgb_p
+        _lf_lgb = last_fold_params["lgb"] if last_fold_params else best_lgb_p
 
-        sc_oos = StandardScaler()
+        sc_oos  = StandardScaler()
         Xtr_oos = sc_oos.fit_transform(X_v[last_tr])
         Xte_oos = sc_oos.transform(X_v[last_te])
         Xtr_oos_df, Xte_oos_df = _df(Xtr_oos), _df(Xte_oos)
-        y5_last = y5[last_tr]
+        lbl_oos_tr = labels[last_tr]
 
-        def _oos(est, Xtr=Xtr_oos, Xte=Xte_oos):
-            return (est.fit(Xtr, y5_last).predict(Xte) * 100).tolist()
+        def _oos_proba(clf, Xtr, Xte, lbl_tr, sw=None, as_df=False):
+            _fit_kw = {"sample_weight": sw} if sw is not None else {}
+            clf.fit(_df(Xtr) if as_df else Xtr, lbl_tr, **_fit_kw)
+            proba = clf.predict_proba(_df(Xte) if as_df else Xte)
+            cls = list(clf.classes_)
+            tp_i = cls.index(2) if 2 in cls else None
+            sl_i = cls.index(0) if 0 in cls else None
+            p_tp = proba[:, tp_i].tolist() if tp_i is not None else [0.0] * len(Xte)
+            p_sl = proba[:, sl_i].tolist() if sl_i is not None else [0.0] * len(Xte)
+            return p_tp, p_sl
 
-        oos = {
-            "Ridge":        _oos(Ridge(alpha=_lf_ridge)),
-            "RandomForest": _oos(RandomForestRegressor(**_lf_rf, random_state=42, n_jobs=1)),
-            "XGBoost":      _oos(xgb.XGBRegressor(**_lf_xgb, random_state=42, verbosity=0, n_jobs=1)),
-            "LightGBM":     _oos(lgb.LGBMRegressor(**_lf_lgb, random_state=42, verbose=-1, n_jobs=1),
-                                 Xtr=Xtr_oos_df, Xte=Xte_oos_df),
+        oos_tp, oos_sl = {}, {}
+        _oos_clfs = {
+            "LogReg":       LogisticRegression(C=_lf_C, max_iter=500, random_state=42,
+                                               solver="lbfgs"),
+            "RandomForest": RandomForestClassifier(**_lf_rf, random_state=42, n_jobs=1),
+            "XGBoost":      xgb.XGBClassifier(**_lf_xgb, random_state=42, verbosity=0,
+                                               n_jobs=1, eval_metric="mlogloss"),
         }
-        oos["Ensemble"] = [(a + b + c + d) / 4
-                           for a, b, c, d in zip(*oos.values())]
-
-        # 预期5日收益率（各模型及集成）
-        ens_return_pct  = float(ens_mean[-1] * 100)
-        model_return_pcts = {
-            "Ridge":        float(lr_mean[-1] * 100),
-            "RandomForest": float(rf_mean[-1] * 100),
-            "XGBoost":      float(xgb_mean[-1] * 100),
-            "LightGBM":     float(lgb_mean[-1] * 100),
-        }
+        w_oos = weights[last_tr]
+        for name, clf in _oos_clfs.items():
+            tp_p, sl_p = _oos_proba(clf, Xtr_oos, Xte_oos, lbl_oos_tr, sw=w_oos)
+            oos_tp[name] = tp_p
+            oos_sl[name] = sl_p
+        lgb_tp_oos, lgb_sl_oos = _oos_proba(
+            lgb.LGBMClassifier(**_lf_lgb, random_state=42, verbose=-1, n_jobs=1),
+            Xtr_oos, Xte_oos, lbl_oos_tr, sw=w_oos, as_df=True,
+        )
+        oos_tp["LightGBM"] = lgb_tp_oos
+        oos_sl["LightGBM"] = lgb_sl_oos
+        _models4 = ["LogReg", "RandomForest", "XGBoost", "LightGBM"]
+        oos_tp["Ensemble"] = [(a + b + c + d) / 4
+                              for a, b, c, d in zip(*[oos_tp[m] for m in _models4])]
+        oos_sl["Ensemble"] = [(a + b + c + d) / 4
+                              for a, b, c, d in zip(*[oos_sl[m] for m in _models4])]
 
         return {
-            "ens_prices": ens_prices, "lr_prices":  lr_prices,
-            "rf_upper":   rf_upper,   "rf_lower":   rf_lower,
-            "cur_close":  cur_close,
-            "ens_return_pct":    ens_return_pct,
-            "model_return_pcts": model_return_pcts,
-            "model_avg_acc":  model_avg_acc,
+            "cur_close":       float(closes[-1]),
+            "ens_tp":          ens_tp,
+            "ens_sl":          ens_sl,
+            "ens_neutral":     ens_neutral,
+            "model_probs":     model_probs,
+            "model_avg_acc":   model_avg_acc,
             "model_fold_accs": {k: v for k, v in fold_accs.items()},
-            "best_params": {"ridge_alpha": best_ridge_alpha,
-                            "rf": best_rf_p, "xgb": best_xgb_p, "lgb": best_lgb_p},
+            "best_params":     {"C": best_C, "rf": best_rf_p,
+                                "xgb": best_xgb_p, "lgb": best_lgb_p},
             "feat_importance": list(zip(feat_names, importance)),
-            "test_dates":  list(dates_tuple)[last_te[0]: last_te[-1] + 1],
-            "oos": oos,
-            "actual_5d":   (y5[last_te] * 100).tolist(),
+            "test_dates":      list(dates_tuple)[last_te[0]: last_te[-1] + 1],
+            "actual_labels":   [int({0: -1, 1: 0, 2: 1}[v]) for v in labels[last_te].tolist()],
+            "oos_tp":          oos_tp,
+            "oos_sl":          oos_sl,
+            "label_counts": {
+                "止盈": int((labels == 2).sum()),
+                "止损": int((labels == 0).sum()),
+                "中立": int((labels == 1).sum()),
+            },
             "horizon": HORIZON, "n_total": valid_n, "n_splits": N_SPLITS,
-            "embargo": EMBARGO,
+            "embargo": EMBARGO, "tp": tp, "sl": sl,
             "error": None,
         }
     except Exception as e:
         return {"error": str(e)}
 
 
-def build_ml_forecast_chart(ml: dict, df: pd.DataFrame, C: dict) -> go.Figure:
+def build_ml_prob_chart(ml: dict, C: dict) -> go.Figure:
+    """Horizontal stacked bar showing TP / Neutral / SL probabilities per model."""
+    models = ["LogReg", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]
+    probs  = ml["model_probs"]
+
     fig = go.Figure()
-
-    # Last 30 days actual prices
-    recent = df["Close"].tail(30)
-    fig.add_trace(go.Scatter(
-        x=list(recent.index), y=recent.tolist(), name="实际收盘价",
-        line=dict(color=C["accent"], width=2),
+    fig.add_trace(go.Bar(
+        name="止盈概率", orientation="h",
+        y=models,
+        x=[probs[m]["tp"] * 100 for m in models],
+        marker_color=C["up"],
+        text=[f"{probs[m]['tp']:.1%}" for m in models],
+        textposition="inside",
+        insidetextanchor="middle",
+        hovertemplate="%{y} 止盈: %{x:.1f}%<extra></extra>",
     ))
-
-    # Next N trading days via business-day range (consistent Timestamp type)
-    last_date = df.index[-1]
-    future_dates = list(
-        pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=ml["horizon"])
-    )
-
-    # Connect today → prediction
-    cx = [last_date] + future_dates
-    ens_y = [ml["cur_close"]] + ml["ens_prices"]
-    lr_y  = [ml["cur_close"]] + ml["lr_prices"]
-    up_y  = [ml["cur_close"]] + ml["rf_upper"]
-    lo_y  = [ml["cur_close"]] + ml["rf_lower"]
-
-    # 95% confidence band
-    fig.add_trace(go.Scatter(
-        x=cx + cx[::-1], y=up_y + lo_y[::-1],
-        fill="toself", fillcolor="rgba(99,102,241,0.10)",
-        line=dict(color="rgba(0,0,0,0)"),
-        name="95% 置信区间", hoverinfo="skip",
+    fig.add_trace(go.Bar(
+        name="中立概率", orientation="h",
+        y=models,
+        x=[probs[m]["neutral"] * 100 for m in models],
+        marker_color=C["border"],
+        text=[f"{probs[m]['neutral']:.1%}" for m in models],
+        textposition="inside",
+        insidetextanchor="middle",
+        hovertemplate="%{y} 中立: %{x:.1f}%<extra></extra>",
     ))
-
-    # Ridge forecast
-    fig.add_trace(go.Scatter(
-        x=cx, y=lr_y, name="Ridge 预测",
-        line=dict(color=C["warn"], width=1.5, dash="dash"),
-        mode="lines",
+    fig.add_trace(go.Bar(
+        name="止损概率", orientation="h",
+        y=models,
+        x=[probs[m]["sl"] * 100 for m in models],
+        marker_color=C["down"],
+        text=[f"{probs[m]['sl']:.1%}" for m in models],
+        textposition="inside",
+        insidetextanchor="middle",
+        hovertemplate="%{y} 止损: %{x:.1f}%<extra></extra>",
     ))
-
-    # Ensemble forecast
-    fig.add_trace(go.Scatter(
-        x=cx, y=ens_y, name="集成模型预测",
-        line=dict(color=C["up"], width=2.5),
-        mode="lines+markers",
-        marker=dict(size=7, color=C["up"]),
-    ))
-
-    # Today marker
-    fig.add_trace(go.Scatter(
-        x=[last_date], y=[ml["cur_close"]], name="今日收盘",
-        mode="markers",
-        marker=dict(size=10, color=C["accent2"], symbol="diamond",
-                    line=dict(color=C["bg"], width=2)),
-    ))
-
-    all_prices = recent.tolist() + ml["ens_prices"] + ml["rf_upper"] + ml["rf_lower"]
-    _ymin = min(all_prices) * 0.995
-    _ymax = max(all_prices) * 1.005
-    fig.add_trace(go.Scatter(
-        x=[last_date, last_date], y=[_ymin, _ymax],
-        mode="lines",
-        line=dict(color=C["dim"], width=1, dash="dot"),
-        showlegend=False, hoverinfo="skip",
-    ))
-
     fig.update_layout(
-        height=360,
+        barmode="stack",
+        height=260,
         paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
         font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
-        xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
-        yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"], title="价格 ($)"),
+        xaxis=dict(title="概率 (%)", gridcolor=C["border"],
+                   zerolinecolor=C["border"], range=[0, 100]),
+        yaxis=dict(gridcolor=C["border"]),
         legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
-                    orientation="h", y=1.10, font=dict(size=11)),
+                    orientation="h", y=1.14, font=dict(size=11)),
         margin=dict(l=0, r=0, t=10, b=0),
-        hovermode="x unified",
     )
     return fig
 
@@ -2395,36 +2423,53 @@ def build_ml_importance_chart(ml: dict, C: dict) -> go.Figure:
 
 
 def build_ml_backtest_chart(ml: dict, C: dict) -> go.Figure:
-    test_dates = [pd.Timestamp(d) for d in ml["test_dates"]]
-    oos = ml.get("oos", {})
+    """OOS chart: predicted TP probability lines + actual label outcome markers."""
+    test_dates   = [pd.Timestamp(d) for d in ml["test_dates"]]
+    oos_tp       = ml.get("oos_tp", {})
+    actual_lbls  = ml.get("actual_labels", [])
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=test_dates, y=ml["actual_5d"], name="实际5日收益",
-        line=dict(color=C["accent"], width=2),
-        fill="tozeroy", fillcolor="rgba(99,102,241,0.05)",
-    ))
+
+    # Actual outcome: vertical tick markers at top/middle/bottom (100/50/0)
+    _lbl_cfg = {1: (C["up"], "止盈", 95), -1: (C["down"], "止损", 5), 0: (C["muted"], "中立", 50)}
+    for lval, (lcolor, lname, ly) in _lbl_cfg.items():
+        idx_list = [i for i, v in enumerate(actual_lbls) if v == lval]
+        if idx_list:
+            fig.add_trace(go.Scatter(
+                x=[test_dates[i] for i in idx_list],
+                y=[ly] * len(idx_list),
+                mode="markers",
+                marker=dict(symbol="line-ns-open", size=8,
+                            color=lcolor,
+                            line=dict(color=lcolor, width=2)),
+                name=f"实际:{lname}",
+            ))
+
     _oos_styles = [
-        ("Ridge",        C["warn"],    "dash"),
+        ("LogReg",       C["warn"],    "dash"),
         ("RandomForest", C["up"],      "dot"),
         ("XGBoost",      C["accent2"], "dashdot"),
         ("LightGBM",     C["blue"],    "dot"),
         ("Ensemble",     C["down"],    "solid"),
     ]
     for name, color, dash in _oos_styles:
-        if name in oos:
+        if name in oos_tp:
             fig.add_trace(go.Scatter(
-                x=test_dates, y=oos[name], name=name,
+                x=test_dates, y=[v * 100 for v in oos_tp[name]],
+                name=f"{name} 止盈概率",
                 line=dict(color=color, width=1.5 if name != "Ensemble" else 2.5, dash=dash),
             ))
-    fig.add_hline(y=0, line_color=C["border"], opacity=0.8)
+
+    fig.add_hline(y=33.3, line_color=C["border"], opacity=0.6, line_dash="dash",
+                  annotation_text="随机基线", annotation_font_size=10)
 
     fig.update_layout(
-        height=220,
+        height=240,
         paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
         font=dict(family="DM Sans, sans-serif", color=C["muted"], size=12),
         xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
         yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"],
-                   title="5日收益率 (%)"),
+                   title="止盈概率 (%)", range=[0, 100]),
         legend=dict(bgcolor=C["surface"], bordercolor=C["border"], borderwidth=1,
                     orientation="h", y=1.12, font=dict(size=11)),
         margin=dict(l=0, r=0, t=10, b=0),
@@ -3367,7 +3412,7 @@ with garch_tab:
         )
 
 with ml_tab:
-    with st.spinner("正在训练集成模型（Ridge · RandomForest · XGBoost · LightGBM）..."):
+    with st.spinner("正在训练集成模型（LogReg · RandomForest · XGBoost · LightGBM）— 三壁障分类..."):
         _ml_feat_tup  = tuple(map(tuple, _ml_feat.round(8)))
         _ml_close_tup = tuple(_ml_close.round(4))
         _ml_dates_tup = tuple(_ml_dates.strftime("%Y-%m-%d"))
@@ -3375,6 +3420,8 @@ with ml_tab:
             _ml_feat_tup, _ml_close_tup, _ml_dates_tup,
             ticker=ticker,
             today_str=str(datetime.today().date()),
+            tp=take_profit_pct / 100,
+            sl=stop_loss_pct / 100,
         )
 
     if ml.get("error") and "missing_lib" in str(ml.get("error", "")):
@@ -3384,30 +3431,33 @@ with ml_tab:
     elif ml.get("error"):
         st.error(f"模型训练失败：{ml['error']}")
     else:
-        # ── Summary metric cards (return forecast + accuracy reference) ──────
-        _acc_color = lambda a: C["up"] if a >= 0.55 else C["warn"] if a >= 0.45 else C["down"]
-        _ret_color = lambda r: C["up"] if r >= 0 else C["down"]
-        _avg = ml["model_avg_acc"]
+        _avg     = ml["model_avg_acc"]
+        _probs   = ml["model_probs"]
+        _ens_tp  = ml["ens_tp"]
+        _ens_sl  = ml["ens_sl"]
         _ens_acc = _avg.get("Ensemble", 0.0)
-        _ens_ret = ml.get("ens_return_pct", 0.0)
-        _model_rets = ml.get("model_return_pcts", {})
-        _best_ret_name = max(_model_rets, key=lambda k: abs(_model_rets[k])) if _model_rets else "Ridge"
-        _best_ret_val  = _model_rets.get(_best_ret_name, 0.0)
+        _lbl_cnt = ml.get("label_counts", {})
 
+        _acc_color  = lambda a: C["up"] if a >= 0.45 else C["warn"] if a >= 0.35 else C["down"]
+        _prob_color = lambda p: C["up"] if p >= 0.4 else C["warn"] if p >= 0.25 else C["muted"]
+
+        # ── Summary metric cards ──────────────────────────────────────────
         ml1, ml2, ml3, ml4 = st.columns(4)
         _ml_cards = [
-            (ml1, "预期5日收益率",
-             f"{_ens_ret:+.2f}%",
-             f"集成模型（4模型均值）", _ret_color(_ens_ret)),
-            (ml2, f"最大分歧模型 ({_best_ret_name})",
-             f"{_best_ret_val:+.2f}%",
-             "单模型预测5日收益率", _ret_color(_best_ret_val)),
-            (ml3, "方向准确率（参考）",
+            (ml1, f"止盈概率（集成）",
+             f"{_ens_tp:.1%}",
+             f"止盈壁障 +{ml['tp']:.0%}",
+             _prob_color(_ens_tp)),
+            (ml2, f"止损概率（集成）",
+             f"{_ens_sl:.1%}",
+             f"止损壁障 -{ml['sl']:.0%}",
+             C["down"] if _ens_sl >= 0.3 else C["muted"]),
+            (ml3, "分类准确率（参考）",
              f"{_ens_acc:.1%}",
              f"Walk-Forward {ml['n_splits']} 折均值", _acc_color(_ens_acc)),
-            (ml4, "有效样本 / 特征",
-             f"{ml['n_total']} / {len(ml['feat_importance'])}",
-             f"预测期 {ml['horizon']} 交易日", C["accent2"]),
+            (ml4, "样本分布",
+             f"{_lbl_cnt.get('止盈', 0)} / {_lbl_cnt.get('中立', 0)} / {_lbl_cnt.get('止损', 0)}",
+             f"止盈 / 中立 / 止损  （共 {ml['n_total']} 条）", C["accent2"]),
         ]
         for col, lbl, val, sub, color in _ml_cards:
             col.markdown(f"""
@@ -3419,18 +3469,18 @@ with ml_tab:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Model return forecast + accuracy comparison table ─────────────
-        _fold_data = ml["model_fold_accs"]
+        # ── Model probability + accuracy table ────────────────────────────
+        _fold_data  = ml["model_fold_accs"]
         _table_rows = []
-        for _mname in ["Ridge", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]:
+        for _mname in ["LogReg", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]:
             _folds = _fold_data.get(_mname, [])
-            _ret_val = (ml.get("ens_return_pct", 0.0)
-                        if _mname == "Ensemble"
-                        else _model_rets.get(_mname, 0.0))
+            _mp = _probs.get(_mname, {})
             _row = {
-                "模型":           _mname,
-                "预期5日收益率":  f"{_ret_val:+.2f}%",
-                "方向准确率（参考）": f"{_avg.get(_mname, 0):.1%}",
+                "模型":       _mname,
+                "止盈概率":   f"{_mp.get('tp', 0):.1%}",
+                "止损概率":   f"{_mp.get('sl', 0):.1%}",
+                "中立概率":   f"{_mp.get('neutral', 0):.1%}",
+                "分类准确率": f"{_avg.get(_mname, 0):.1%}",
             }
             for _fi, _fv in enumerate(_folds):
                 _row[f"Fold {_fi+1}"] = f"{_fv:.1%}"
@@ -3439,39 +3489,34 @@ with ml_tab:
 
         st.markdown(
             f"<div style='font-size:12px;color:{C['muted']};margin-bottom:6px;'>"
-            "各模型预期5日收益率 · Walk-Forward 方向准确率（参考）</div>",
+            f"各模型三壁障分类概率 · Walk-Forward 分类准确率（止盈 +{ml['tp']:.0%} / 止损 -{ml['sl']:.0%} / 横壁障 {ml['horizon']} 日）</div>",
             unsafe_allow_html=True,
         )
 
         def _style_cell(v):
-            if not isinstance(v, str):
+            if not isinstance(v, str) or not v.endswith("%"):
                 return ""
-            if v.endswith("%"):
-                try:
-                    num = float(v.rstrip("%").replace("+", ""))
-                    if v.startswith("+") or ("+" in v and v.index("+") == 0):
-                        # return % column
-                        return f"color:{C['up']};font-weight:600" if num > 0 else f"color:{C['down']};font-weight:600"
-                    # accuracy column
-                    return (f"color:{C['up']};font-weight:600" if num >= 55
-                            else f"color:{C['down']}" if num < 45 else "")
-                except ValueError:
-                    return ""
-            return ""
+            try:
+                num = float(v.rstrip("%"))
+                # detect probability columns by range (0–100 displayed as X.X%)
+                return (f"color:{C['up']};font-weight:600" if num >= 40
+                        else f"color:{C['down']}" if num < 20 else "")
+            except ValueError:
+                return ""
 
         st.dataframe(_acc_df.style.map(_style_cell), width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Forecast chart + feature importance ───────────────────────────
+        # ── Probability chart + feature importance ────────────────────────
         fc_col, imp_col = st.columns([3, 2])
         with fc_col:
             st.markdown(
                 f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
-                f"未来 {ml['horizon']} 交易日价格预测（集成模型 + 95% 置信区间）</div>",
+                f"各模型三壁障概率分布（止盈 +{ml['tp']:.0%} · 止损 -{ml['sl']:.0%} · 横壁障 {ml['horizon']} 日）</div>",
                 unsafe_allow_html=True,
             )
-            st.plotly_chart(build_ml_forecast_chart(ml, df, C), width="stretch")
+            st.plotly_chart(build_ml_prob_chart(ml, C), width="stretch")
         with imp_col:
             st.markdown(
                 f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
@@ -3483,7 +3528,7 @@ with ml_tab:
         # ── OOS backtest ──────────────────────────────────────────────────
         st.markdown(
             f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
-            "样本外回测：各模型预测 vs 实际 5日收益率（%）</div>",
+            "样本外回测：各模型止盈概率预测 vs 实际三壁障结果</div>",
             unsafe_allow_html=True,
         )
         st.plotly_chart(build_ml_backtest_chart(ml, C), width="stretch")
@@ -3491,9 +3536,9 @@ with ml_tab:
         _ml_dim = C["dim"]
         st.markdown(
             f"<div style='font-size:11px;color:{_ml_dim};margin-top:4px;'>"
-            f"目标：未来5日收益率（回归） &nbsp;·&nbsp; "
+            f"标签：三壁障法（止盈 +{ml['tp']:.0%} / 止损 -{ml['sl']:.0%} / 横壁障 {ml['horizon']} 日）&nbsp;·&nbsp; "
             f"特征（17维·滚动Z分·已调权价格）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
-            f"模型：Ridge + RandomForest + XGBoost + LightGBM &nbsp;·&nbsp; "
+            f"模型：LogReg + RandomForest + XGBoost + LightGBM &nbsp;·&nbsp; "
             f"验证：Walk-Forward {ml['n_splits']} 折（Embargo {ml['embargo']}日）&nbsp;·&nbsp; "
             f"超参数：自动调优（内层 3 折）</div>",
             unsafe_allow_html=True,
