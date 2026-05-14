@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import anthropic
+from google import genai as google_genai
 from datetime import datetime, timedelta
 import time
 import warnings
@@ -408,24 +408,35 @@ def compute_score(
     return score, reasons
 
 
+def _sentiment_bonus(sentiment_score: float | None) -> float:
+    """Map sentiment score to weighted_score adjustment.
+    >+30: +0.3 (boost BUY), <-30: -0.3 (suppress BUY), otherwise: 0.
+    Returns 0 when sentiment_score is None (no API Key configured)."""
+    if sentiment_score is None:
+        return 0.0
+    if sentiment_score > 30:
+        return 0.3
+    if sentiment_score < -30:
+        return -0.3
+    return 0.0
+
+
 def compute_signal_scores(
     df: pd.DataFrame,
     regime_info: dict | None = None,
     rsi_weight: int = 2,
 ) -> pd.Series:
     """
-    Time-weighted score series for ALL bars.
+    Time-weighted score series for ALL bars (used by backtest).
 
     Pass 1 — raw score for every bar via compute_score (single source of truth).
     Pass 2 — 3-day exponential-style weighting:
         weighted[i] = 0.5 * raw[i] + 0.3 * raw[i-1] + 0.2 * raw[i-2]
-    When fewer than 3 scored bars precede i, weights are renormalised so the
-    result stays on the same scale as the raw score:
-        i == 1  (only today):              weighted = raw[i]
-        i == 2  (today + yesterday):       weighted = (0.5·r[i] + 0.3·r[i-1]) / 0.8
-        i >= 3  (full 3-day history):      weighted = 0.5·r[i] + 0.3·r[i-1] + 0.2·r[i-2]
 
-    Used by run_backtest for entry decisions; reasons are discarded.
+    Note: news sentiment is intentionally NOT applied here — Yahoo Finance
+    news has no historical record, so using today's sentiment for past bars
+    would be look-ahead bias. Sentiment factor lives only in get_signal()
+    for live decisions.
     """
     if regime_info is None:
         regime_info = compute_regime(df)
@@ -810,6 +821,7 @@ def get_signal(
     spy_bear: bool = False,
     insider_adj: float = 0.0,
     near_earnings: bool = False,
+    sentiment_score: float | None = None,
 ) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
@@ -859,6 +871,14 @@ def get_signal(
     elif insider_adj < 0:
         reasons.append(f"内部人(CEO/CFO)大额卖出 → 压制信号 ({insider_adj:+.1f}分)")
     weighted_score = weighted_score + insider_adj
+
+    # ── Sentiment factor: shift weighted_score by ±0.3 based on news sentiment ──
+    _senti_bonus = _sentiment_bonus(sentiment_score)
+    if _senti_bonus > 0:
+        reasons.append(f"新闻情绪 {sentiment_score:+.0f} 偏正面 → 加强信号 (+{_senti_bonus:.1f}分)")
+    elif _senti_bonus < 0:
+        reasons.append(f"新闻情绪 {sentiment_score:+.0f} 偏负面 → 压制信号 ({_senti_bonus:+.1f}分)")
+    weighted_score = weighted_score + _senti_bonus
 
     # Volatility filter — overrides buy_threshold regardless of regime
     if regime_info["vol_filter"].iloc[-1]:
@@ -1078,33 +1098,128 @@ def fetch_news(ticker: str) -> list[dict]:
     return items
 
 
-def get_news_sentiment(ticker: str, headlines: list[str], api_key: str) -> dict:
-    numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
-    prompt = f"""你是一位专业金融分析师。根据以下 {ticker} 最新新闻标题，评估整体市场情绪。
+_GEMINI_RATE_LIMIT_MSG = "API请求频率超限，请稍后再试"
 
-{numbered}
 
-严格按以下格式输出，不要有任何其他内容：
-SCORE: <-100到+100的整数，-100极度悲观，0中性，+100极度乐观>
-REASON: <15字以内的一句话理由>"""
+def _handle_429(resp, attempt: int) -> bool:
+    """Returns True if caller should retry (after waiting), False if caller should raise."""
+    import time as _time
+    if attempt == 0:
+        _slot = st.empty()
+        for _s in range(60, 0, -1):
+            _slot.warning(f"⏸ 分析已暂停，{_s} 秒后自动重试…")
+            _time.sleep(1)
+        _slot.empty()
+        return True
+    return False
 
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=80,
-        messages=[{"role": "user", "content": prompt}],
+
+def _gemini_generate(prompt: str, api_key: str) -> str:
+    """Call Gemini REST API directly; retries once after 60 s on 429; raises on other errors."""
+    import requests as _requests
+    import json as _json
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={api_key}"
     )
-    text = msg.content[0].text.strip()
-    score, reason = 0, "分析完成"
-    for line in text.splitlines():
-        if line.startswith("SCORE:"):
+    body = _json.dumps(
+        {"contents": [{"parts": [{"text": prompt}]}]},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+
+    for attempt in range(2):
+        resp = _requests.post(url, data=body, headers=headers, timeout=30)
+        if resp.status_code == 429:
+            if _handle_429(resp, attempt):
+                continue
+            raise _requests.exceptions.HTTPError(_GEMINI_RATE_LIMIT_MSG, response=resp)
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _deepseek_generate(prompt: str, api_key: str) -> str:
+    """Call DeepSeek (OpenAI-compatible) chat completions endpoint."""
+    import requests as _requests
+    import json as _json
+    url = "https://api.deepseek.com/v1/chat/completions"
+    body = _json.dumps(
+        {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    for attempt in range(2):
+        resp = _requests.post(url, data=body, headers=headers, timeout=60)
+        if resp.status_code == 429:
+            if _handle_429(resp, attempt):
+                continue
+            raise _requests.exceptions.HTTPError(_GEMINI_RATE_LIMIT_MSG, response=resp)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+def _ai_generate(prompt: str, api_key: str) -> str:
+    """Dispatch to Gemini or DeepSeek based on API Key prefix."""
+    k = (api_key or "").strip()
+    # DeepSeek keys start with "sk-" but not "sk-ant-" (Anthropic) or "sk-proj-" (OpenAI project)
+    if k.startswith("sk-") and not k.startswith("sk-ant-") and not k.startswith("sk-proj-"):
+        return _deepseek_generate(prompt, k)
+    return _gemini_generate(prompt, k)
+
+
+def get_news_sentiment(ticker: str, headlines: list[str], api_key: str) -> dict:
+    """
+    One API call returns one integer per headline (one per line, -100..+100).
+    Aggregates to a single score via average.
+    Returns {'score': int, 'reason': str, 'individual': list[int]}.
+    Never raises.
+    """
+    _key = str(api_key).strip()
+    if not _key:
+        return {"score": 0, "reason": "未提供 API Key", "error": "no_key"}
+    if not headlines:
+        return {"score": 0, "reason": "无新闻数据", "individual": []}
+    try:
+        numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
+        n = len(headlines)
+        prompt = (
+            f"你是一位专业金融分析师。请对以下每条 {ticker} 新闻标题打分，"
+            f"评估其对股价的情绪倾向，从 -100（极度悲观）到 +100（极度乐观），0 表示中性。\n\n"
+            f"{numbered}\n\n"
+            f"只输出 {n} 行数字，每行对应一条新闻的得分，不要有任何其他内容。"
+        )
+        text = _ai_generate(prompt, _key).strip()
+
+        scores = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
-                score = max(-100, min(100, int(line.split(":", 1)[1].strip())))
+                scores.append(max(-100, min(100, int(line))))
             except ValueError:
                 pass
-        elif line.startswith("REASON:"):
-            reason = line.split(":", 1)[1].strip()
-    return {"score": score, "reason": reason}
+
+        if not scores:
+            return {"score": 0, "reason": "解析失败", "individual": [], "error": "no_scores"}
+
+        avg = int(round(sum(scores) / len(scores)))
+        parsed = len(scores)
+        reason = f"基于 {parsed} 条新闻，平均情绪分 {avg:+d}"
+        return {"score": avg, "reason": reason, "individual": scores}
+    except Exception as exc:
+        msg = str(exc)
+        is_rl = msg.startswith(_GEMINI_RATE_LIMIT_MSG)
+        return {"score": 0, "reason": msg if is_rl else "分析失败",
+                "individual": [], "error": msg}
 
 
 def generate_rule_report(
@@ -1187,10 +1302,17 @@ def generate_rule_report(
 
 
 def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[str], api_key: str) -> str:
-    last = df.iloc[-1]
-    price_change = ((df["Close"].iloc[-1] - df["Close"].iloc[-20]) / df["Close"].iloc[-20] * 100)
+    """Returns analysis text. Never raises — returns error notice string on any failure."""
+    import time as _time
+    _key = str(api_key).strip()
+    if not _key:
+        return "未提供 API Key，无法生成 AI 分析。"
+    _time.sleep(1)  # 1 s gap after sentiment call to avoid back-to-back 429
+    try:
+        last = df.iloc[-1]
+        price_change = ((df["Close"].iloc[-1] - df["Close"].iloc[-20]) / df["Close"].iloc[-20] * 100)
 
-    prompt = f"""你是一位专业的美股量化分析师。请根据以下技术指标数据，对 {ticker} 股票给出简明专业的分析报告。
+        prompt = f"""你是一位专业的美股量化分析师。请根据以下技术指标数据，对 {ticker} 股票给出简明专业的分析报告。
 
 ## 当前指标数据
 - 最新收盘价: ${float(last['Close']):.2f}
@@ -1210,14 +1332,10 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
 3. 操作建议（结合信号，给出具体思路）
 
 注意：这仅为技术分析，不构成投资建议。"""
-
-    client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+        return _ai_generate(prompt, _key)
+    except Exception as exc:
+        msg = str(exc)
+        return msg if msg.startswith(_GEMINI_RATE_LIMIT_MSG) else f"AI 分析暂时不可用：{msg}"
 
 
 @st.cache_data(ttl=600)
@@ -2027,12 +2145,14 @@ def build_chart(df: pd.DataFrame, ticker: str, C: dict) -> go.Figure:
 @st.cache_data(ttl=86400)  # daily cache: same ticker + same day tunes only once
 def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                       ticker: str = "", today_str: str = "",
+                      atr_tuple: tuple = (),
                       tp: float = 0.05, sl: float = 0.03) -> dict:
     try:
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.utils.class_weight import compute_sample_weight
         import xgboost as xgb
         import lightgbm as lgb
     except ImportError as e:
@@ -2050,25 +2170,29 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         if n < MIN_ROWS + HORIZON:
             return {"error": "insufficient_data"}
 
-        # ── Triple-barrier labels ─────────────────────────────────────────────
-        # For each bar: scan forward up to HORIZON days.
-        # Hit +tp first → label 1; hit -sl first → label -1; neither → label 0.
+        # ── Triple-barrier labels — ATR-based dynamic barriers ────────────────
+        # Upper barrier = 2 × ATR14/Close; Lower barrier = 1.5 × ATR14/Close.
+        # Falls back to fixed tp/sl when ATR unavailable.
+        # Hit upper first → label 2 (止盈); hit lower first → label 0 (止损);
+        # neither within HORIZON days → label 1 (无信号).
         valid_n = n - HORIZON
         X_v = X[:valid_n]
-        labels = np.zeros(valid_n, dtype=int)
+        atr_pct = np.array(atr_tuple, dtype=float) if atr_tuple else np.full(n, np.nan)
+
+        labels = np.ones(valid_n, dtype=int)   # default: 1 = 无信号
         for idx in range(valid_n):
-            entry = closes[idx]
+            entry   = closes[idx]
+            _atr_i  = atr_pct[idx] if idx < len(atr_pct) else np.nan
+            _tp_bar = 2.0  * _atr_i  if not np.isnan(_atr_i) else tp
+            _sl_bar = 1.5  * _atr_i  if not np.isnan(_atr_i) else sl
             for h in range(1, HORIZON + 1):
                 ret = (closes[idx + h] - entry) / entry
-                if ret >= tp:
+                if ret >= _tp_bar:
                     labels[idx] = 2   # 止盈
                     break
-                if ret <= -sl:
+                if ret <= -_sl_bar:
                     labels[idx] = 0   # 止损
                     break
-            # default 1 = 无信号 (already set by np.zeros → need explicit set)
-            else:
-                labels[idx] = 1
 
         # Time-decay sample weights: exp(-lambda * age_in_days), lambda=0.005
         _DECAY   = 0.005
@@ -2109,8 +2233,10 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                 Xte_s = sc.transform(X_raw[te])
                 Xtr_ = _df(Xtr_s) if as_df else Xtr_s
                 Xte_ = _df(Xte_s) if as_df else Xte_s
-                _fit_kw = {"sample_weight": sw[tr]} if sw is not None else {}
-                estimator.fit(Xtr_, ys[tr], **_fit_kw)
+                # Class-balanced weights combined with time-decay
+                _cls_w = compute_sample_weight("balanced", ys[tr])
+                _eff_w = (sw[tr] * _cls_w) if sw is not None else _cls_w
+                estimator.fit(Xtr_, ys[tr], sample_weight=_eff_w)
                 scores.append(float(np.mean(estimator.predict(Xte_) == ys[te])))
             return float(np.mean(scores)) if scores else 0.0
 
@@ -2177,7 +2303,7 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             if len(fold_tr) < 30 or len(fold_te) < 30:
                 continue
 
-            w_fold = weights[fold_tr]
+            w_fold = weights[fold_tr] * compute_sample_weight("balanced", labels[fold_tr])
             f_C, f_rf, f_xgb, f_lgb = _tune_fold(X_v[fold_tr], labels[fold_tr], sw=w_fold)
 
             sc = StandardScaler()
@@ -2216,7 +2342,8 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                          for k, v in fold_accs.items()}
 
         # ── Global tuning + final retrain on all data ─────────────────────────
-        best_C, best_rf_p, best_xgb_p, best_lgb_p = _tune_fold(X_v, labels, sw=weights)
+        w_all = weights * compute_sample_weight("balanced", labels)
+        best_C, best_rf_p, best_xgb_p, best_lgb_p = _tune_fold(X_v, labels, sw=w_all)
 
         scaler2  = StandardScaler()
         X_all_s  = scaler2.fit_transform(X_v)
@@ -2225,15 +2352,15 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         x_now_df = _df(x_now)
 
         lr_f  = LogisticRegression(C=best_C, max_iter=500, random_state=42,
-                                   solver="lbfgs").fit(X_all_s, labels, sample_weight=weights)
+                                   solver="lbfgs").fit(X_all_s, labels, sample_weight=w_all)
         rf_f  = RandomForestClassifier(**best_rf_p, random_state=42, n_jobs=1).fit(
-                                   X_all_s, labels, sample_weight=weights)
+                                   X_all_s, labels, sample_weight=w_all)
         xgb_f = xgb.XGBClassifier(**best_xgb_p, random_state=42, verbosity=0,
                                    n_jobs=1, eval_metric="mlogloss").fit(
-                                   X_all_s, labels, sample_weight=weights)
+                                   X_all_s, labels, sample_weight=w_all)
         lgb_f = lgb.LGBMClassifier(**best_lgb_p, random_state=42,
                                    verbose=-1, n_jobs=1).fit(
-                                   X_all_df, labels, sample_weight=weights)
+                                   X_all_df, labels, sample_weight=w_all)
 
         # Extract P(止盈)=P(1), P(止损)=P(-1) for each classifier
         def _extract_proba(clf, x):
@@ -2280,8 +2407,9 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         lbl_oos_tr = labels[last_tr]
 
         def _oos_proba(clf, Xtr, Xte, lbl_tr, sw=None, as_df=False):
-            _fit_kw = {"sample_weight": sw} if sw is not None else {}
-            clf.fit(_df(Xtr) if as_df else Xtr, lbl_tr, **_fit_kw)
+            _cls_w = compute_sample_weight("balanced", lbl_tr)
+            _eff_w = (sw * _cls_w) if sw is not None else _cls_w
+            clf.fit(_df(Xtr) if as_df else Xtr, lbl_tr, sample_weight=_eff_w)
             proba = clf.predict_proba(_df(Xte) if as_df else Xte)
             cls = list(clf.classes_)
             tp_i = cls.index(2) if 2 in cls else None
@@ -2315,6 +2443,10 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         oos_sl["Ensemble"] = [(a + b + c + d) / 4
                               for a, b, c, d in zip(*[oos_sl[m] for m in _models4])]
 
+        # Current ATR: last non-NaN value in the full atr_pct array (most recent bar)
+        _valid_atr = atr_pct[~np.isnan(atr_pct)]
+        _cur_atr_v = float(_valid_atr[-1]) if len(_valid_atr) > 0 else None
+
         return {
             "cur_close":       float(closes[-1]),
             "ens_tp":          ens_tp,
@@ -2336,7 +2468,11 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                 "中立": int((labels == 1).sum()),
             },
             "horizon": HORIZON, "n_total": valid_n, "n_splits": N_SPLITS,
-            "embargo": EMBARGO, "tp": tp, "sl": sl,
+            "embargo": EMBARGO,
+            "cur_atr_pct":  _cur_atr_v,
+            "cur_tp_bar":   float(2.0 * _cur_atr_v) if _cur_atr_v is not None else tp,
+            "cur_sl_bar":   float(1.5 * _cur_atr_v) if _cur_atr_v is not None else sl,
+            "atr_based":    len(atr_tuple) > 0 and _cur_atr_v is not None,
             "error": None,
         }
     except Exception as e:
@@ -2483,7 +2619,9 @@ with st.sidebar:
     st.markdown("### 参数配置")
     ticker = st.text_input("股票代码", value="AAPL", placeholder="AAPL / TSLA / NVDA").upper().strip()
     period = st.selectbox("回看周期", ["1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "7y", "10y", "max"], index=2)
-    api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
+    api_key = st.text_input("API Key (Gemini 或 DeepSeek)", type="password",
+                            placeholder="AIza... 或 sk-...",
+                            help="Gemini Key 以 AIza 开头；DeepSeek Key 以 sk- 开头（自动识别）")
 
     st.markdown("---")
     st.markdown("### 回测参数")
@@ -2606,6 +2744,10 @@ st.markdown(f"""
 
 if run_btn:
     st.session_state["analysis_active"] = True
+    # Clear cached AI results so the new ticker/period gets fresh analysis
+    for _k in list(st.session_state.keys()):
+        if _k.startswith("_sentiment_") or _k.startswith("_analysis_"):
+            del st.session_state[_k]
 
 if not st.session_state.get("analysis_active"):
     st.markdown(f"""
@@ -2858,6 +3000,8 @@ _ml_mask  = ~np.any(np.isnan(_ml_feat) | np.isinf(_ml_feat), axis=1)
 _ml_feat  = _ml_feat[_ml_mask]
 _ml_close = _close_arr[_ml_mask]
 _ml_dates = df.index[_ml_mask]
+# Raw ATR14/Close ratio (pre-Z-score) for dynamic triple-barrier barriers
+_ml_atr   = _atr_n[_ml_mask]   # ATR as fraction of close, same mask
 
 # ── Beta adaptive strategy ────────────────────────────────────────────────────
 _beta_raw = info.get("beta")
@@ -2885,12 +3029,28 @@ else:
     _range_thr    = 2.0
     _rsi_weight   = 2
 
+# ── Pre-fetch news sentiment (so signal system + backtest can use it) ────────
+# Skip entirely if no API Key — sentiment_score stays None and bonus is 0
+_sentiment_for_signal: float | None = None
+if api_key:
+    _senti_key = f"_sentiment_{ticker}"
+    if _senti_key not in st.session_state:
+        with st.spinner("分析新闻情绪..."):
+            _news_for_senti = fetch_news(ticker)
+            _hl = [n["title"] for n in _news_for_senti] if _news_for_senti else []
+            if _hl:
+                st.session_state[_senti_key] = get_news_sentiment(ticker, _hl, api_key)
+    _cached_senti = st.session_state.get(_senti_key)
+    if _cached_senti and "error" not in _cached_senti:
+        _sentiment_for_signal = float(_cached_senti.get("score", 0))
+
 # ── Signal + Fear & Greed ─────────────────────────────────────────────────────
 signal, reasons, regime_info = get_signal(
     df,
     uptrend_thr=_uptrend_thr,
     range_thr=_range_thr,
     rsi_weight=_rsi_weight,
+    sentiment_score=_sentiment_for_signal,
 )
 fg = fetch_fear_greed()
 
@@ -3416,12 +3576,12 @@ with ml_tab:
         _ml_feat_tup  = tuple(map(tuple, _ml_feat.round(8)))
         _ml_close_tup = tuple(_ml_close.round(4))
         _ml_dates_tup = tuple(_ml_dates.strftime("%Y-%m-%d"))
+        _ml_atr_tup   = tuple(_ml_atr.round(6))
         ml = run_ml_prediction(
             _ml_feat_tup, _ml_close_tup, _ml_dates_tup,
             ticker=ticker,
             today_str=str(datetime.today().date()),
-            tp=take_profit_pct / 100,
-            sl=stop_loss_pct / 100,
+            atr_tuple=_ml_atr_tup,
         )
 
     if ml.get("error") and "missing_lib" in str(ml.get("error", "")):
@@ -3431,26 +3591,47 @@ with ml_tab:
     elif ml.get("error"):
         st.error(f"模型训练失败：{ml['error']}")
     else:
-        _avg     = ml["model_avg_acc"]
-        _probs   = ml["model_probs"]
-        _ens_tp  = ml["ens_tp"]
-        _ens_sl  = ml["ens_sl"]
-        _ens_acc = _avg.get("Ensemble", 0.0)
-        _lbl_cnt = ml.get("label_counts", {})
+        _avg        = ml["model_avg_acc"]
+        _probs      = ml["model_probs"]
+        _ens_tp     = ml["ens_tp"]
+        _ens_sl     = ml["ens_sl"]
+        _ens_acc    = _avg.get("Ensemble", 0.0)
+        _lbl_cnt    = ml.get("label_counts", {})
+        _cur_atr    = ml.get("cur_atr_pct")        # ATR/Close ratio, may be None
+        _cur_tp_bar = ml.get("cur_tp_bar", 0.05)
+        _cur_sl_bar = ml.get("cur_sl_bar", 0.03)
+        _atr_based  = ml.get("atr_based", False)
 
         _acc_color  = lambda a: C["up"] if a >= 0.45 else C["warn"] if a >= 0.35 else C["down"]
         _prob_color = lambda p: C["up"] if p >= 0.4 else C["warn"] if p >= 0.25 else C["muted"]
 
+        # ── ATR info banner ───────────────────────────────────────────────
+        if _atr_based and _cur_atr is not None:
+            _atr_pct_str = f"{_cur_atr:.2%}"
+            _tp_str      = f"{_cur_tp_bar:.2%}"
+            _sl_str      = f"{_cur_sl_bar:.2%}"
+            st.markdown(
+                f"<div style='font-size:12px;color:{C['muted']};padding:6px 10px;"
+                f"border-left:3px solid {C['accent2']};margin-bottom:12px;'>"
+                f"动态壁障（ATR-based）&nbsp;·&nbsp; "
+                f"当前 ATR14 = <b style='color:{C['text']};'>{_atr_pct_str}</b>"
+                f"（占收盘价百分比）&nbsp;·&nbsp; "
+                f"上壁障（止盈）= 2× ATR = <b style='color:{C['up']};'>+{_tp_str}</b>&nbsp;·&nbsp; "
+                f"下壁障（止损）= 1.5× ATR = <b style='color:{C['down']};'>-{_sl_str}</b>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
         # ── Summary metric cards ──────────────────────────────────────────
         ml1, ml2, ml3, ml4 = st.columns(4)
         _ml_cards = [
-            (ml1, f"止盈概率（集成）",
+            (ml1, "止盈概率（集成）",
              f"{_ens_tp:.1%}",
-             f"止盈壁障 +{ml['tp']:.0%}",
+             f"上壁障 +{_cur_tp_bar:.1%}（2×ATR）",
              _prob_color(_ens_tp)),
-            (ml2, f"止损概率（集成）",
+            (ml2, "止损概率（集成）",
              f"{_ens_sl:.1%}",
-             f"止损壁障 -{ml['sl']:.0%}",
+             f"下壁障 -{_cur_sl_bar:.1%}（1.5×ATR）",
              C["down"] if _ens_sl >= 0.3 else C["muted"]),
             (ml3, "分类准确率（参考）",
              f"{_ens_acc:.1%}",
@@ -3489,7 +3670,7 @@ with ml_tab:
 
         st.markdown(
             f"<div style='font-size:12px;color:{C['muted']};margin-bottom:6px;'>"
-            f"各模型三壁障分类概率 · Walk-Forward 分类准确率（止盈 +{ml['tp']:.0%} / 止损 -{ml['sl']:.0%} / 横壁障 {ml['horizon']} 日）</div>",
+            f"各模型三壁障分类概率 · Walk-Forward 分类准确率（上壁障 2×ATR / 下壁障 1.5×ATR / 横壁障 {ml['horizon']} 日）</div>",
             unsafe_allow_html=True,
         )
 
@@ -3513,7 +3694,7 @@ with ml_tab:
         with fc_col:
             st.markdown(
                 f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
-                f"各模型三壁障概率分布（止盈 +{ml['tp']:.0%} · 止损 -{ml['sl']:.0%} · 横壁障 {ml['horizon']} 日）</div>",
+                f"各模型三壁障概率分布（上壁障 +{_cur_tp_bar:.1%} · 下壁障 -{_cur_sl_bar:.1%} · 横壁障 {ml['horizon']} 日）</div>",
                 unsafe_allow_html=True,
             )
             st.plotly_chart(build_ml_prob_chart(ml, C), width="stretch")
@@ -3536,7 +3717,7 @@ with ml_tab:
         _ml_dim = C["dim"]
         st.markdown(
             f"<div style='font-size:11px;color:{_ml_dim};margin-top:4px;'>"
-            f"标签：三壁障法（止盈 +{ml['tp']:.0%} / 止损 -{ml['sl']:.0%} / 横壁障 {ml['horizon']} 日）&nbsp;·&nbsp; "
+            f"标签：三壁障法（上壁障 2×ATR14 / 下壁障 1.5×ATR14 / 横壁障 {ml['horizon']} 日）&nbsp;·&nbsp; "
             f"特征（17维·滚动Z分·已调权价格）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
             f"模型：LogReg + RandomForest + XGBoost + LightGBM &nbsp;·&nbsp; "
             f"验证：Walk-Forward {ml['n_splits']} 折（Embargo {ml['embargo']}日）&nbsp;·&nbsp; "
@@ -3755,10 +3936,16 @@ if not news_items:
 else:
     # ── Sentiment score (only with API key) ───────────────────────────────────
     if api_key:
-        with st.spinner("Claude 正在分析情绪..."):
-            try:
+        _senti_key = f"_sentiment_{ticker}"
+        if _senti_key not in st.session_state:
+            with st.spinner("Gemini 正在分析情绪..."):
                 headlines = [n["title"] for n in news_items]
-                sentiment = get_news_sentiment(ticker, headlines, api_key)
+                _senti_result = get_news_sentiment(ticker, headlines, api_key)
+                st.session_state[_senti_key] = _senti_result  # cache both success and error
+        sentiment = st.session_state[_senti_key]
+        if "error" in sentiment:
+            st.error(f"情绪分析失败：{sentiment['error']}")
+        else:
                 sc = sentiment["score"]
 
                 if sc >= 40:
@@ -3772,9 +3959,7 @@ else:
                 else:
                     sc_color, sc_label = "#f43f5e", "偏空 · 消极"
 
-                # Bar: left half = negative zone, right half = positive zone
-                # Fill from center outward
-                bar_pct = abs(sc) / 2   # 0–50% of total width from center
+                bar_pct = abs(sc) / 2
                 if sc >= 0:
                     bar_css = f"position:absolute;left:50%;width:{bar_pct}%;height:100%;background:{sc_color};border-radius:0 4px 4px 0;"
                 else:
@@ -3799,8 +3984,6 @@ else:
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
-            except Exception as e:
-                st.error(f"情绪分析失败：{e}")
     else:
         st.info("输入 API Key 后启用情绪分析（-100 到 +100 评分）。")
 
@@ -3829,28 +4012,31 @@ if not api_key:
     <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
       <span style='background:{C["border"]};color:{C["muted"]};font-size:11px;padding:3px 10px;
                    border-radius:4px;font-family:Space Mono,monospace;'>规则驱动</span>
-      <span style='font-size:12px;color:{C["dim"]};'>输入 API Key 后切换为 Claude 深度分析</span>
+      <span style='font-size:12px;color:{C["dim"]};'>输入 API Key 后切换为 Gemini 深度分析</span>
     </div>""", unsafe_allow_html=True)
     st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
 else:
-    with st.spinner("Claude 正在分析中..."):
-        try:
-            report = get_ai_analysis(ticker, df, signal, reasons, api_key)
-            st.markdown(f"""
-            <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
-              <span style='background:{C["surface"]};color:{C["accent2"]};font-size:11px;padding:3px 10px;
-                           border:1px solid {C["border"]};border-radius:4px;font-family:Space Mono,monospace;'>Claude AI</span>
-            </div>""", unsafe_allow_html=True)
-            st.markdown(f"<div class='ai-report'>{report}</div>", unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"Claude 分析失败：{e}")
-            rule_report = generate_rule_report(ticker, df, signal, info)
-            st.markdown(f"""
-            <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
-              <span style='background:{C["border"]};color:{C["muted"]};font-size:11px;padding:3px 10px;
-                           border-radius:4px;font-family:Space Mono,monospace;'>规则驱动（回退）</span>
-            </div>""", unsafe_allow_html=True)
-            st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
+    _analysis_key = f"_analysis_{ticker}_{period}"
+    if _analysis_key not in st.session_state:
+        with st.spinner("Gemini 正在分析中..."):
+            st.session_state[_analysis_key] = get_ai_analysis(ticker, df, signal, reasons, api_key)
+    report = st.session_state[_analysis_key]
+    if not report or report.startswith("AI 分析暂时不可用") or report.startswith("未提供") or report.startswith(_GEMINI_RATE_LIMIT_MSG):
+        st.error(report)
+        rule_report = generate_rule_report(ticker, df, signal, info)
+        st.markdown(f"""
+        <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
+          <span style='background:{C["border"]};color:{C["muted"]};font-size:11px;padding:3px 10px;
+                       border-radius:4px;font-family:Space Mono,monospace;'>规则驱动（回退）</span>
+        </div>""", unsafe_allow_html=True)
+        st.markdown(f"<div class='ai-report'>{rule_report}</div>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px;'>
+          <span style='background:{C["surface"]};color:{C["accent2"]};font-size:11px;padding:3px 10px;
+                       border:1px solid {C["border"]};border-radius:4px;font-family:Space Mono,monospace;'>Gemini AI</span>
+        </div>""", unsafe_allow_html=True)
+        st.markdown(f"<div class='ai-report'>{report}</div>", unsafe_allow_html=True)
 
 # ── Raw data ──────────────────────────────────────────────────────────────────
 with st.expander("查看原始数据"):
