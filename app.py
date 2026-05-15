@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from google import genai as google_genai
 from datetime import datetime, timedelta
 import time
 import warnings
@@ -328,6 +327,33 @@ def compute_regime(df: pd.DataFrame) -> dict:
     }
 
 
+def compute_rs(stock_close, spy_close, idx: int = -1, window: int = 20) -> float | None:
+    """Relative Strength: (1 + stock_20d_ret) / (1 + spy_20d_ret).
+    >1 means stock outperformed SPY over the window; <1 underperformed.
+    Returns None if not enough data or invalid SPY value.
+    Accepts pd.Series or np.ndarray. idx can be negative (Python-style)."""
+    if stock_close is None or spy_close is None:
+        return None
+    sc = stock_close.values if hasattr(stock_close, "values") else stock_close
+    sp = spy_close.values if hasattr(spy_close, "values") else spy_close
+    n = len(sc)
+    if n != len(sp) or n <= window:
+        return None
+    pos = idx if idx >= 0 else n + idx
+    if pos < window or pos >= n:
+        return None
+    s_now, s_then = float(sc[pos]), float(sc[pos - window])
+    p_now, p_then = float(sp[pos]), float(sp[pos - window])
+    if s_then <= 0 or p_then <= 0:
+        return None
+    s_ret = s_now / s_then - 1.0
+    p_ret = p_now / p_then - 1.0
+    denom = 1.0 + p_ret
+    if denom <= 0:  # SPY lost more than 100% in window — impossible but defensive
+        return None
+    return (1.0 + s_ret) / denom
+
+
 def compute_score(
     df: pd.DataFrame,
     idx: int,
@@ -353,6 +379,13 @@ def compute_score(
     score   : int  — positive = bullish pressure, negative = bearish
     reasons : list[str] — human-readable explanations (ignored by backtest)
     """
+    # Length guard: need at least 2 bars (current + previous) for crossover checks.
+    # Normalise negative idx so checks are uniform.
+    n = len(df)
+    pos_idx = idx if idx >= 0 else n + idx
+    if n < 2 or pos_idx < 1 or pos_idx >= n:
+        return 0, []
+
     last   = df.iloc[idx]
     prev   = df.iloc[idx - 1]
     regime = str(regime_info["regimes"].iloc[idx])
@@ -475,14 +508,22 @@ def run_backtest(
     uptrend_thr: float = 1.5,
     range_thr: float = 2.0,
     rsi_weight: int = 2,
+    spy_full: pd.DataFrame | None = None,
 ) -> dict:
     """
     Simulate the signal strategy on historical data.
     Entry on BUY (score >= threshold) at next-day open.
+
+    Filters applied at each bar (mirrors get_signal where possible):
+      - DOWNTREND regime: no entries
+      - Volatility spike (ATR > 2× 20-day avg): no entries
+      - 2-bar cooldown after exiting DOWNTREND
+      - Volume confirmation: current bar volume must exceed 20-day average
+      - SPY bear (if spy_full provided): MA20 < MA50 blocks entries
+    NOT applied (would be look-ahead bias since data isn't historical per-bar):
+      - Insider trades, earnings proximity, news sentiment
+
     Exit priority: stop-loss → take-profit → 时间止损 → sell signal → max holding days.
-      SL/TP/时间止损: triggered by close price, executed at that same close.
-      Signal/hold/end exits: executed at next-day open.
-    Slippage and commission are applied on both entry and exit legs.
     """
     regime_info = compute_regime(df)
     scores  = compute_signal_scores(df, regime_info=regime_info, rsi_weight=rsi_weight)
@@ -491,8 +532,28 @@ def run_backtest(
     opens   = df["Open"].values
     highs   = df["High"].values
     lows    = df["Low"].values
+    volumes = df["Volume"].values
     dates   = df.index
     n       = len(df)
+
+    # Per-bar volume confirmation: today's volume must exceed 20-day average
+    _vol_avg20 = pd.Series(volumes).rolling(20, min_periods=5).mean().values
+
+    # Per-bar SPY bear flag + RS series, both aligned to df.index via ffill
+    _RS_WINDOW = 20
+    _rs_series = np.full(n, np.nan)   # NaN where insufficient history
+    if spy_full is not None and not spy_full.empty and {"MA20", "MA50"}.issubset(spy_full.columns):
+        _spy_aligned = spy_full.reindex(df.index, method="ffill")
+        _spy_bear_series = (_spy_aligned["MA20"] < _spy_aligned["MA50"]).fillna(False).values
+        _spy_close_arr = _spy_aligned["Close"].values
+        for _i in range(_RS_WINDOW, n):
+            _s_then, _p_then = closes[_i - _RS_WINDOW], _spy_close_arr[_i - _RS_WINDOW]
+            if _s_then > 0 and _p_then > 0 and not np.isnan(_p_then):
+                _denom = _spy_close_arr[_i] / _p_then
+                if _denom > 0 and not np.isnan(_denom):
+                    _rs_series[_i] = (closes[_i] / _s_then) / _denom
+    else:
+        _spy_bear_series = np.zeros(n, dtype=bool)
 
     # ATR-based position sizing: 14-day ATR vs 20-day rolling mean ATR
     _prev_c = np.roll(closes, 1); _prev_c[0] = closes[0]
@@ -543,8 +604,19 @@ def run_backtest(
             # Volatility spike: ATR > 2× 20-day mean ATR blocks entry
             if regime_info["vol_filter"].iloc[i]:
                 continue
+            # SPY bear with RS escape: stock can override SPY bear if RS > 1.1
+            _rs_i = _rs_series[i]
+            if _spy_bear_series[i] and (np.isnan(_rs_i) or _rs_i <= 1.1):
+                continue
+            # RS-based suppression: never buy a laggard regardless of regime
+            if not np.isnan(_rs_i) and _rs_i < 0.9:
+                continue
             entry_threshold = uptrend_thr if cur_reg == "UPTREND" else range_thr
             if scores.iloc[i] >= entry_threshold:
+                # Volume confirmation: today's volume must exceed 20-day avg
+                _va = _vol_avg20[i]
+                if not np.isnan(_va) and _va > 0 and volumes[i] <= _va:
+                    continue
                 entry_idx = i + 1
                 # Execute at next-day open (more realistic than close-to-close)
                 entry_price    = float(opens[entry_idx]) * (1 + slippage + commission)
@@ -822,6 +894,7 @@ def get_signal(
     insider_adj: float = 0.0,
     near_earnings: bool = False,
     sentiment_score: float | None = None,
+    rs: float | None = None,
 ) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
@@ -890,7 +963,21 @@ def get_signal(
     regime_info["weighted_score"] = weighted_score
     regime_info["buy_threshold"]  = buy_threshold
 
+    # Stash RS for caller display regardless of which branch is taken
+    if rs is not None:
+        regime_info["rs"] = rs
+        if rs > 1.1:
+            reasons.append(f"相对强度 RS={rs:.2f} 跑赢大盘（>1.10），独立 alpha")
+        elif rs < 0.9:
+            reasons.append(f"相对强度 RS={rs:.2f} 跑输大盘（<0.90），缺乏动能")
+        else:
+            reasons.append(f"相对强度 RS={rs:.2f}，与大盘同步")
+
     if buy_threshold is not None and weighted_score >= buy_threshold:
+        # ── RS-based suppression: never buy a laggard regardless of regime ────
+        if rs is not None and rs < 0.9:
+            reasons.append("个股跑输大盘超过10%，暂停买入")
+            return "HOLD", reasons, regime_info
         # ── Filter 1: volume confirmation ─────────────────────────────────────
         _vol_series = df["Volume"]
         _vol_avg20  = _vol_series.rolling(20, min_periods=5).mean()
@@ -899,8 +986,10 @@ def get_signal(
         if _vol_avg > 0 and _vol_now <= _vol_avg:
             reasons.append(f"成交量({_vol_now/1e6:.1f}M)低于20日均量({_vol_avg/1e6:.1f}M)，BUY未确认")
             return "HOLD", reasons, regime_info
-        # ── Filter 2: cross-asset SPY bear market ─────────────────────────────
-        if spy_bear:
+        # ── Filter 2: cross-asset SPY bear, with RS escape hatch ──────────────
+        # RS > 1.1 means the stock is showing independent strength; allow BUY
+        # even when the broader market is bearish.
+        if spy_bear and (rs is None or rs <= 1.1):
             reasons.append("大盘趋势向下（SPY MA20<MA50），暂停个股买入")
             return "HOLD", reasons, regime_info
         # ── Filter 4: earnings proximity ──────────────────────────────────────
@@ -948,7 +1037,11 @@ def fetch_data(ticker: str, period: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def scan_ticker(tkr: str) -> dict:
+def scan_ticker(tkr: str, spy_bear: bool = False) -> dict:
+    """Multi-ticker scan helper. Mirrors main-page get_signal context:
+    same beta-mode threshold tier, same SPY bear filter (computed once, passed in).
+    Skips per-ticker insider / earnings / sentiment (those would require
+    per-ticker API calls — too slow for a scan)."""
     try:
         df = yf.download(tkr, period="3mo", progress=False, auto_adjust=True)
         if df.empty or len(df) < 30:
@@ -963,7 +1056,22 @@ def scan_ticker(tkr: str) -> dict:
         df = df.dropna(subset=["RSI", "MACD", "BB_Upper"])
         if len(df) < 2:
             return {"ticker": tkr, "error": "no_data"}
-        sig, _, _ri = get_signal(df)
+
+        # Beta-mode tier (matches main page logic)
+        try:
+            _info = fetch_ticker_info(tkr)
+            _b_raw = _info.get("beta")
+            _b = float(_b_raw) if _b_raw is not None else None
+        except Exception:
+            _b = None
+        if _b is not None and _b < 0.8:
+            _upt, _rng, _rsiw = 1.0, 1.5, 1
+        else:
+            _upt, _rng, _rsiw = 1.5, 2.0, 2
+
+        sig, _, _ri = get_signal(df,
+                                 uptrend_thr=_upt, range_thr=_rng, rsi_weight=_rsiw,
+                                 spy_bear=spy_bear)
         price = float(df["Close"].iloc[-1])
         chg   = (price - float(df["Close"].iloc[-2])) / float(df["Close"].iloc[-2]) * 100
         rsi   = float(df["RSI"].iloc[-1])
@@ -1198,15 +1306,16 @@ def get_news_sentiment(ticker: str, headlines: list[str], api_key: str) -> dict:
         )
         text = _ai_generate(prompt, _key).strip()
 
+        import re as _re
         scores = []
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
-            try:
-                scores.append(max(-100, min(100, int(line))))
-            except ValueError:
-                pass
+            # Tolerate "1. 45", "50 (积极)", "Score: 30", "+25" etc.
+            match = _re.search(r"-?\d+", line)
+            if match:
+                scores.append(max(-100, min(100, int(match.group()))))
 
         if not scores:
             return {"score": 0, "reason": "解析失败", "individual": [], "error": "no_scores"}
@@ -1228,6 +1337,8 @@ def generate_rule_report(
     signal: str,
     info: dict,
 ) -> str:
+    if len(df) < 2:
+        return "⚠️ 数据不足，无法生成规则驱动分析（需要至少 2 个交易日）。"
     last = df.iloc[-1]
     prev = df.iloc[-2]
     rsi = float(last["RSI"])
@@ -1237,7 +1348,10 @@ def generate_rule_report(
     bb_upper = float(last["BB_Upper"])
     bb_lower = float(last["BB_Lower"])
     bb_mid = float(last["BB_Mid"])
-    price_20d_pct = (close - float(df["Close"].iloc[-20])) / float(df["Close"].iloc[-20]) * 100
+    # iloc[-20] needs ≥20 bars; fall back to the earliest available bar otherwise
+    _ref_idx = -20 if len(df) >= 20 else 0
+    _ref_close = float(df["Close"].iloc[_ref_idx])
+    price_20d_pct = (close - _ref_close) / _ref_close * 100 if _ref_close > 0 else 0.0
 
     parts = []
 
@@ -1308,9 +1422,13 @@ def get_ai_analysis(ticker: str, df: pd.DataFrame, signal: str, reasons: list[st
     if not _key:
         return "未提供 API Key，无法生成 AI 分析。"
     _time.sleep(1)  # 1 s gap after sentiment call to avoid back-to-back 429
+    if len(df) < 2:
+        return "数据不足，无法生成 AI 分析（需要至少 2 个交易日）。"
     try:
         last = df.iloc[-1]
-        price_change = ((df["Close"].iloc[-1] - df["Close"].iloc[-20]) / df["Close"].iloc[-20] * 100)
+        _ref_idx = -20 if len(df) >= 20 else 0
+        _ref_close = float(df["Close"].iloc[_ref_idx])
+        price_change = ((float(df["Close"].iloc[-1]) - _ref_close) / _ref_close * 100) if _ref_close > 0 else 0.0
 
         prompt = f"""你是一位专业的美股量化分析师。请根据以下技术指标数据，对 {ticker} 股票给出简明专业的分析报告。
 
@@ -2663,7 +2781,14 @@ with st.sidebar:
             t.strip().upper() for t in _scan_input.split(",") if t.strip()
         ))[:10]
         with st.spinner(f"扫描 {len(_scan_tickers)} 只股票..."):
-            _scan_raw = [scan_ticker(t) for t in _scan_tickers]
+            # Compute SPY bear flag once (shared across all tickers in this scan)
+            _scan_spy = fetch_spy_full("6mo")
+            _scan_spy_bear = False
+            if not _scan_spy.empty and {"MA20", "MA50"}.issubset(_scan_spy.columns):
+                _last_spy = _scan_spy.dropna().iloc[-1] if not _scan_spy.dropna().empty else None
+                if _last_spy is not None:
+                    _scan_spy_bear = float(_last_spy["MA20"]) < float(_last_spy["MA50"])
+            _scan_raw = [scan_ticker(t, spy_bear=_scan_spy_bear) for t in _scan_tickers]
         _scan_raw.sort(key=lambda r: (r.get("sort_key", 1), r.get("ticker", "")))
         st.session_state["scan_results"] = _scan_raw
 
@@ -3044,13 +3169,26 @@ if api_key:
     if _cached_senti and "error" not in _cached_senti:
         _sentiment_for_signal = float(_cached_senti.get("score", 0))
 
+# ── SPY data + spy_bear + RS for live signal ─────────────────────────────────
+_spy_for_signal = fetch_spy_full(period)
+_spy_bear_now = False
+_rs_now: float | None = None
+if not _spy_for_signal.empty and {"MA20", "MA50", "Close"}.issubset(_spy_for_signal.columns):
+    _spy_aligned_live = _spy_for_signal.reindex(df.index, method="ffill")
+    _last_spy = _spy_aligned_live.dropna(subset=["MA20", "MA50"]).iloc[-1] if not _spy_aligned_live.dropna(subset=["MA20", "MA50"]).empty else None
+    if _last_spy is not None:
+        _spy_bear_now = float(_last_spy["MA20"]) < float(_last_spy["MA50"])
+    _rs_now = compute_rs(df["Close"], _spy_aligned_live["Close"], idx=-1, window=20)
+
 # ── Signal + Fear & Greed ─────────────────────────────────────────────────────
 signal, reasons, regime_info = get_signal(
     df,
     uptrend_thr=_uptrend_thr,
     range_thr=_range_thr,
     rsi_weight=_rsi_weight,
+    spy_bear=_spy_bear_now,
     sentiment_score=_sentiment_for_signal,
+    rs=_rs_now,
 )
 fg = fetch_fear_greed()
 
@@ -3180,6 +3318,7 @@ st.markdown(
 )
 
 with st.spinner("回测计算中..."):
+    _spy_for_bt = _spy_for_signal if "_spy_for_signal" in dir() else fetch_spy_full(period)
     bt = run_backtest(
         df,
         holding_days=holding_days,
@@ -3193,6 +3332,7 @@ with st.spinner("回测计算中..."):
         uptrend_thr=_uptrend_thr,
         range_thr=_range_thr,
         rsi_weight=_rsi_weight,
+        spy_full=_spy_for_bt,
     )
 
 if bt["metrics"] is None:
