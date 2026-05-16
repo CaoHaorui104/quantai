@@ -327,31 +327,53 @@ def compute_regime(df: pd.DataFrame) -> dict:
     }
 
 
-def compute_rs(stock_close, spy_close, idx: int = -1, window: int = 20) -> float | None:
-    """Relative Strength: (1 + stock_20d_ret) / (1 + spy_20d_ret).
-    >1 means stock outperformed SPY over the window; <1 underperformed.
-    Returns None if not enough data or invalid SPY value.
-    Accepts pd.Series or np.ndarray. idx can be negative (Python-style)."""
-    if stock_close is None or spy_close is None:
+def compute_rs_spread(stock_close, ref_close, idx: int = -1, window: int = 20) -> float | None:
+    """Relative Strength as a percentage-point spread:
+        rs = stock_window_return_pct - ref_window_return_pct
+    rs = 0   → in line with reference (SPY or sector ETF)
+    rs = +9  → stock outperformed reference by 9 percentage points
+    rs = -5  → stock underperformed reference by 5 percentage points
+    Returns None if there isn't enough history."""
+    if stock_close is None or ref_close is None:
         return None
     sc = stock_close.values if hasattr(stock_close, "values") else stock_close
-    sp = spy_close.values if hasattr(spy_close, "values") else spy_close
+    rc = ref_close.values if hasattr(ref_close, "values") else ref_close
     n = len(sc)
-    if n != len(sp) or n <= window:
+    if n != len(rc) or n <= window:
         return None
     pos = idx if idx >= 0 else n + idx
     if pos < window or pos >= n:
         return None
     s_now, s_then = float(sc[pos]), float(sc[pos - window])
-    p_now, p_then = float(sp[pos]), float(sp[pos - window])
-    if s_then <= 0 or p_then <= 0:
+    r_now, r_then = float(rc[pos]), float(rc[pos - window])
+    if s_then <= 0 or r_then <= 0:
         return None
-    s_ret = s_now / s_then - 1.0
-    p_ret = p_now / p_then - 1.0
-    denom = 1.0 + p_ret
-    if denom <= 0:  # SPY lost more than 100% in window — impossible but defensive
-        return None
-    return (1.0 + s_ret) / denom
+    s_ret = (s_now / s_then - 1.0) * 100.0
+    r_ret = (r_now / r_then - 1.0) * 100.0
+    return s_ret - r_ret
+
+
+def _spy_penalty_for_beta(beta: float | None) -> float:
+    """Beta-tiered SPY-bear penalty applied to weighted_score:
+       beta > 1.2          →  0.0  (high-beta: ignore SPY filter; stock has own alpha)
+       0.9 ≤ beta ≤ 1.2    → -0.5  (neutral: moderate market-tracking penalty)
+       beta < 0.9          → -1.0  (defensive: full penalty, follows broad market)
+    Unknown beta defaults to neutral tier."""
+    if beta is None:
+        return -0.5
+    if beta > 1.2:
+        return 0.0
+    if beta >= 0.9:
+        return -0.5
+    return -1.0
+
+
+def _beta_tier_label(beta: float | None) -> tuple[str, str]:
+    """Returns (label_zh, tier_key). tier_key ∈ {'high','neutral','defensive','unknown'}."""
+    if beta is None:        return ("未知 Beta",        "unknown")
+    if beta > 1.2:          return ("高Beta (>1.2)",   "high")
+    if beta >= 0.9:         return ("中性 (0.9-1.2)",  "neutral")
+    return ("防御 (<0.9)",  "defensive")
 
 
 def compute_score(
@@ -509,18 +531,20 @@ def run_backtest(
     range_thr: float = 2.0,
     rsi_weight: int = 2,
     spy_full: pd.DataFrame | None = None,
+    beta: float | None = None,
 ) -> dict:
     """
     Simulate the signal strategy on historical data.
-    Entry on BUY (score >= threshold) at next-day open.
 
-    Filters applied at each bar (mirrors get_signal where possible):
-      - DOWNTREND regime: no entries
-      - Volatility spike (ATR > 2× 20-day avg): no entries
-      - 2-bar cooldown after exiting DOWNTREND
+    Score adjustment per bar (added to weighted_score before threshold check):
+      - SPY bear (MA20 < MA50), beta-tiered penalty:
+          beta > 1.2   →  0.0   (high-beta: skip SPY filter)
+          0.9-1.2      → -0.5
+          beta < 0.9   → -1.0
+    Hard blocks:
+      - DOWNTREND regime, volatility spike, 2-bar cooldown after DOWNTREND
       - Volume confirmation: current bar volume must exceed 20-day average
-      - SPY bear (if spy_full provided): MA20 < MA50 blocks entries
-    NOT applied (would be look-ahead bias since data isn't historical per-bar):
+    NOT applied (look-ahead bias):
       - Insider trades, earnings proximity, news sentiment
 
     Exit priority: stop-loss → take-profit → 时间止损 → sell signal → max holding days.
@@ -539,21 +563,15 @@ def run_backtest(
     # Per-bar volume confirmation: today's volume must exceed 20-day average
     _vol_avg20 = pd.Series(volumes).rolling(20, min_periods=5).mean().values
 
-    # Per-bar SPY bear flag + RS series, both aligned to df.index via ffill
-    _RS_WINDOW = 20
-    _rs_series = np.full(n, np.nan)   # NaN where insufficient history
+    # Per-bar SPY bear flag (sector RS removed — see attribution analysis: it hurt Sharpe)
     if spy_full is not None and not spy_full.empty and {"MA20", "MA50"}.issubset(spy_full.columns):
         _spy_aligned = spy_full.reindex(df.index, method="ffill")
         _spy_bear_series = (_spy_aligned["MA20"] < _spy_aligned["MA50"]).fillna(False).values
-        _spy_close_arr = _spy_aligned["Close"].values
-        for _i in range(_RS_WINDOW, n):
-            _s_then, _p_then = closes[_i - _RS_WINDOW], _spy_close_arr[_i - _RS_WINDOW]
-            if _s_then > 0 and _p_then > 0 and not np.isnan(_p_then):
-                _denom = _spy_close_arr[_i] / _p_then
-                if _denom > 0 and not np.isnan(_denom):
-                    _rs_series[_i] = (closes[_i] / _s_then) / _denom
     else:
         _spy_bear_series = np.zeros(n, dtype=bool)
+
+    # Beta-tiered SPY penalty (precomputed once)
+    _spy_penalty = _spy_penalty_for_beta(beta)
 
     # ATR-based position sizing: 14-day ATR vs 20-day rolling mean ATR
     _prev_c = np.roll(closes, 1); _prev_c[0] = closes[0]
@@ -604,15 +622,10 @@ def run_backtest(
             # Volatility spike: ATR > 2× 20-day mean ATR blocks entry
             if regime_info["vol_filter"].iloc[i]:
                 continue
-            # SPY bear with RS escape: stock can override SPY bear if RS > 1.1
-            _rs_i = _rs_series[i]
-            if _spy_bear_series[i] and (np.isnan(_rs_i) or _rs_i <= 1.1):
-                continue
-            # RS-based suppression: never buy a laggard regardless of regime
-            if not np.isnan(_rs_i) and _rs_i < 0.9:
-                continue
+            # Beta-tiered SPY bear penalty (sector/SPY RS removed — see attribution)
+            _adj = _spy_penalty if _spy_bear_series[i] else 0.0
             entry_threshold = uptrend_thr if cur_reg == "UPTREND" else range_thr
-            if scores.iloc[i] >= entry_threshold:
+            if (scores.iloc[i] + _adj) >= entry_threshold:
                 # Volume confirmation: today's volume must exceed 20-day avg
                 _va = _vol_avg20[i]
                 if not np.isnan(_va) and _va > 0 and volumes[i] <= _va:
@@ -894,20 +907,25 @@ def get_signal(
     insider_adj: float = 0.0,
     near_earnings: bool = False,
     sentiment_score: float | None = None,
-    rs: float | None = None,
+    rs_spy: float | None = None,
+    beta: float | None = None,
 ) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
-    Scoring rules live exclusively in compute_score(); this function adds the
-    regime-threshold layer, volatility-filter, and four extra filters:
-      1. Volume confirmation  — current volume must exceed 20-day average.
-      2. Cross-asset (SPY)   — BUY blocked when SPY MA20 < MA50.
-      3. Insider trading      — CEO/CFO large trades adjust weighted_score ±0.5.
-      4. Earnings proximity   — BUY blocked within 3 days of earnings.
-
-    uptrend_thr / range_thr: BUY thresholds, adapted by Beta mode.
-    rsi_weight: RSI score magnitude (2 standard, 1 for low-beta 稳健模式).
-    SELL uses raw_score <= -2 (today's raw score only).
+    Score adjustments (all stack on weighted_score):
+      • Insider trades:        ±0.5 (CEO/CFO 大额)
+      • News sentiment:        ±0.3 (>+30 / <-30)
+      • SPY bear, beta-tiered:
+          beta > 1.2   →  0.0  (high-beta: independent alpha, no penalty)
+          0.9-1.2      → -0.5
+          beta < 0.9   → -1.0
+    Hard blocks (no score):
+      • DOWNTREND regime:      buy_threshold=None (BUY impossible)
+      • Volatility spike:      buy_threshold=None
+      • Volume confirmation:   today's volume must exceed 20-day average
+      • Earnings proximity:    BUY blocked within 3 days of earnings
+    Display-only (no score effect):
+      • RS_SPY spread (rs_spy): shown in reasons for context
     """
     regime_info = compute_regime(df)
     regime      = regime_info["current"]
@@ -953,7 +971,29 @@ def get_signal(
         reasons.append(f"新闻情绪 {sentiment_score:+.0f} 偏负面 → 压制信号 ({_senti_bonus:+.1f}分)")
     weighted_score = weighted_score + _senti_bonus
 
-    # Volatility filter — overrides buy_threshold regardless of regime
+    # ── SPY bear regime, beta-tiered penalty ────────────────────────────────────
+    _beta_label, _beta_tier = _beta_tier_label(beta)
+    _spy_pen = _spy_penalty_for_beta(beta) if spy_bear else 0.0
+    if spy_bear and _spy_pen < 0:
+        reasons.append(
+            f"大盘趋势向下（SPY MA20<MA50）+ {_beta_label} → 压制信号 ({_spy_pen:+.1f}分)"
+        )
+    elif spy_bear and _spy_pen == 0:
+        reasons.append(
+            f"大盘趋势向下，但 {_beta_label} 跳过 SPY 过滤（独立 alpha）"
+        )
+    weighted_score = weighted_score + _spy_pen
+
+    # ── RS_SPY: display only, no score effect ──────────────────────────────────
+    if rs_spy is not None:
+        if rs_spy > 4:
+            reasons.append(f"相对强度 RS vs SPY = {rs_spy:+.1f}pp（跑赢大盘，仅参考）")
+        elif rs_spy < -4:
+            reasons.append(f"相对强度 RS vs SPY = {rs_spy:+.1f}pp（跑输大盘，仅参考）")
+        else:
+            reasons.append(f"相对强度 RS vs SPY = {rs_spy:+.1f}pp（与大盘同步）")
+
+    # Volatility filter — hard block on buy_threshold regardless of regime
     if regime_info["vol_filter"].iloc[-1]:
         _atr_ratio = regime_info["cur_atr"] / max(regime_info["cur_atr_mean"], 1e-9)
         reasons.append(f"波动率过高（ATR {_atr_ratio:.1f}×均值），暂停买入")
@@ -962,23 +1002,14 @@ def get_signal(
     regime_info["raw_score"]      = raw_score
     regime_info["weighted_score"] = weighted_score
     regime_info["buy_threshold"]  = buy_threshold
-
-    # Stash RS for caller display regardless of which branch is taken
-    if rs is not None:
-        regime_info["rs"] = rs
-        if rs > 1.1:
-            reasons.append(f"相对强度 RS={rs:.2f} 跑赢大盘（>1.10），独立 alpha")
-        elif rs < 0.9:
-            reasons.append(f"相对强度 RS={rs:.2f} 跑输大盘（<0.90），缺乏动能")
-        else:
-            reasons.append(f"相对强度 RS={rs:.2f}，与大盘同步")
+    regime_info["rs_spy"]         = rs_spy
+    regime_info["beta"]           = beta
+    regime_info["beta_tier"]      = _beta_tier
+    regime_info["beta_label"]     = _beta_label
+    regime_info["spy_penalty"]    = _spy_pen
 
     if buy_threshold is not None and weighted_score >= buy_threshold:
-        # ── RS-based suppression: never buy a laggard regardless of regime ────
-        if rs is not None and rs < 0.9:
-            reasons.append("个股跑输大盘超过10%，暂停买入")
-            return "HOLD", reasons, regime_info
-        # ── Filter 1: volume confirmation ─────────────────────────────────────
+        # ── Volume confirmation (hard block) ──────────────────────────────────
         _vol_series = df["Volume"]
         _vol_avg20  = _vol_series.rolling(20, min_periods=5).mean()
         _vol_now    = float(_vol_series.iloc[-1])
@@ -986,13 +1017,7 @@ def get_signal(
         if _vol_avg > 0 and _vol_now <= _vol_avg:
             reasons.append(f"成交量({_vol_now/1e6:.1f}M)低于20日均量({_vol_avg/1e6:.1f}M)，BUY未确认")
             return "HOLD", reasons, regime_info
-        # ── Filter 2: cross-asset SPY bear, with RS escape hatch ──────────────
-        # RS > 1.1 means the stock is showing independent strength; allow BUY
-        # even when the broader market is bearish.
-        if spy_bear and (rs is None or rs <= 1.1):
-            reasons.append("大盘趋势向下（SPY MA20<MA50），暂停个股买入")
-            return "HOLD", reasons, regime_info
-        # ── Filter 4: earnings proximity ──────────────────────────────────────
+        # ── Earnings proximity (hard block) ───────────────────────────────────
         if near_earnings:
             reasons.append("距财报日≤3天，规避财报风险，暂停买入")
             return "HOLD", reasons, regime_info
@@ -2069,23 +2094,58 @@ def fetch_spy_6m() -> pd.Series:
 
 
 @st.cache_data(ttl=300)
-def fetch_spy_full(period: str) -> pd.DataFrame:
-    """Fetch SPY OHLCV for the given period and compute MA20/MA50.
-    Returns a DataFrame with columns [Close, MA20, MA50] indexed by date.
-    Used for cross-asset bear-market filter in signals and backtest.
-    """
+def fetch_etf_full(symbol: str, period: str) -> pd.DataFrame:
+    """Fetch any ETF OHLCV with MA20/MA50.
+    Returns DataFrame [Close, MA20, MA50] or empty DataFrame on failure."""
     try:
-        spy = yf.download("SPY", period=period, progress=False, auto_adjust=True)
-        if spy.empty:
+        etf = yf.download(symbol, period=period, progress=False, auto_adjust=True)
+        if etf.empty:
             return pd.DataFrame()
-        if isinstance(spy.columns, pd.MultiIndex):
-            spy.columns = spy.columns.get_level_values(0)
-        out = spy[["Close"]].copy()
+        if isinstance(etf.columns, pd.MultiIndex):
+            etf.columns = etf.columns.get_level_values(0)
+        out = etf[["Close"]].copy()
         out["MA20"] = out["Close"].rolling(20).mean()
         out["MA50"] = out["Close"].rolling(50).mean()
         return out
     except Exception:
         return pd.DataFrame()
+
+
+def fetch_spy_full(period: str) -> pd.DataFrame:
+    """Convenience wrapper preserving the old call signature."""
+    return fetch_etf_full("SPY", period)
+
+
+def get_sector_etf(info: dict) -> tuple[str | None, str | None]:
+    """Map a yfinance ticker info dict to (etf_symbol, display_label).
+    Returns (None, None) when no clean mapping exists."""
+    industry = str(info.get("industry") or "").lower()
+    sector   = str(info.get("sector")   or "").lower()
+
+    # Industry-level overrides — more specific than the broad sector ETF
+    if "semiconductor" in industry:                  return ("SOXX", "SOXX · 半导体")
+    if "software" in industry:                        return ("IGV",  "IGV · 软件")
+    if "biotech" in industry:                         return ("IBB",  "IBB · 生物科技")
+    if "bank" in industry:                            return ("KRE",  "KRE · 区域银行")
+
+    # Sector-level fallback (SPDR sector ETFs)
+    if "technology" in sector:                        return ("XLK",  "XLK · 科技")
+    if "communication" in sector:                     return ("XLC",  "XLC · 通信服务")
+    if "financial" in sector:                         return ("XLF",  "XLF · 金融")
+    if "healthcare" in sector or "health care" in sector:
+        return ("XLV", "XLV · 医疗")
+    if "consumer cyclical" in sector or "consumer discretionary" in sector:
+        return ("XLY", "XLY · 可选消费")
+    if "consumer defensive" in sector or "consumer staples" in sector:
+        return ("XLP", "XLP · 必选消费")
+    if "energy" in sector:                            return ("XLE",  "XLE · 能源")
+    if "industrials" in sector or "industrial" in sector:
+        return ("XLI", "XLI · 工业")
+    if "utilities" in sector:                         return ("XLU",  "XLU · 公用事业")
+    if "real estate" in sector:                       return ("XLRE", "XLRE · 房地产")
+    if "basic materials" in sector or "materials" in sector:
+        return ("XLB", "XLB · 原材料")
+    return (None, None)
 
 
 def compute_insider_adj(insider_rows: list[dict]) -> float:
@@ -3169,16 +3229,21 @@ if api_key:
     if _cached_senti and "error" not in _cached_senti:
         _sentiment_for_signal = float(_cached_senti.get("score", 0))
 
-# ── SPY data + spy_bear + RS for live signal ─────────────────────────────────
+# ── SPY data for beta-tiered penalty + RS_SPY display ────────────────────────
+# (Sector ETF helpers are kept for future use — see get_sector_etf / fetch_etf_full —
+#  but they no longer feed the score. Attribution analysis showed sector RS hurt Sharpe.)
 _spy_for_signal = fetch_spy_full(period)
 _spy_bear_now = False
-_rs_now: float | None = None
+_spy_regime_now = "—"
+_rs_spy_now: float | None = None
 if not _spy_for_signal.empty and {"MA20", "MA50", "Close"}.issubset(_spy_for_signal.columns):
     _spy_aligned_live = _spy_for_signal.reindex(df.index, method="ffill")
-    _last_spy = _spy_aligned_live.dropna(subset=["MA20", "MA50"]).iloc[-1] if not _spy_aligned_live.dropna(subset=["MA20", "MA50"]).empty else None
-    if _last_spy is not None:
+    _spy_drop = _spy_aligned_live.dropna(subset=["MA20", "MA50"])
+    if not _spy_drop.empty:
+        _last_spy = _spy_drop.iloc[-1]
         _spy_bear_now = float(_last_spy["MA20"]) < float(_last_spy["MA50"])
-    _rs_now = compute_rs(df["Close"], _spy_aligned_live["Close"], idx=-1, window=20)
+        _spy_regime_now = "UPTREND" if not _spy_bear_now else "DOWNTREND"
+    _rs_spy_now = compute_rs_spread(df["Close"], _spy_aligned_live["Close"], idx=-1, window=20)
 
 # ── Signal + Fear & Greed ─────────────────────────────────────────────────────
 signal, reasons, regime_info = get_signal(
@@ -3188,7 +3253,8 @@ signal, reasons, regime_info = get_signal(
     rsi_weight=_rsi_weight,
     spy_bear=_spy_bear_now,
     sentiment_score=_sentiment_for_signal,
-    rs=_rs_now,
+    rs_spy=_rs_spy_now,
+    beta=_beta_val,
 )
 fg = fetch_fear_greed()
 
@@ -3233,6 +3299,42 @@ else:
         f"</div>"
     )
 
+# ── Cross-asset display strings (used in signal box) ──────────────────────────
+def _regime_color_html(regime_str):
+    if regime_str == "UPTREND":   return C["up"], "上涨"
+    if regime_str == "DOWNTREND": return C["down"], "下跌"
+    return C["muted"], "—"
+
+_spy_col_v, _spy_zh = _regime_color_html(_spy_regime_now)
+
+def _rs_disp(rs_val):
+    if rs_val is None:
+        return "—", C["muted"]
+    col = C["up"] if rs_val > 4 else C["down"] if rs_val < -4 else C["muted"]
+    return f"{rs_val:+.1f}pp", col
+
+_rs_spy_txt, _rs_spy_col = _rs_disp(_rs_spy_now)
+
+# Beta tier display
+_beta_tier_lbl_zh, _beta_tier_key = _beta_tier_label(_beta_val)
+_tier_col = {"high": C["up"], "neutral": C["accent2"], "defensive": C["warn"], "unknown": C["muted"]}[_beta_tier_key]
+_spy_pen_now = _spy_penalty_for_beta(_beta_val)
+_pen_txt = f"过滤权重 {_spy_pen_now:+.1f}分" if _spy_pen_now != 0 else "跳过 SPY 过滤"
+
+_cross_asset_html = (
+    f"<div style='margin-top:8px; padding:7px 9px; background:{C['surface']};"
+    f" border:1px solid {C['border']}; border-radius:6px; font-size:10px; line-height:1.7;'>"
+    f"<div><span style='color:{C['dim']};'>Market (SPY)</span> &nbsp;"
+    f"<span style='color:{_spy_col_v}; font-weight:600;'>{_spy_zh}</span></div>"
+    f"<div><span style='color:{C['dim']};'>当前 Beta 分段</span> &nbsp;"
+    f"<span style='color:{_tier_col}; font-weight:600;'>{_beta_tier_lbl_zh}</span>"
+    f" &nbsp;<span style='color:{C['dim']}; font-size:9px;'>· {_pen_txt}</span></div>"
+    f"<div><span style='color:{C['dim']};'>RS vs SPY</span> &nbsp;"
+    f"<span style='font-family:Space Mono,monospace; color:{_rs_spy_col}; font-weight:600;'>{_rs_spy_txt}</span>"
+    f" &nbsp;<span style='color:{C['dim']}; font-size:9px;'>· 仅参考</span></div>"
+    f"</div>"
+)
+
 col_sig, col_reasons, col_fg = st.columns([1, 2, 1])
 with col_sig:
     st.markdown(f"""
@@ -3263,6 +3365,7 @@ with col_sig:
       </div>
       {_beta_badge_html}
     </div>
+    {_cross_asset_html}
     """, unsafe_allow_html=True)
 
 with col_reasons:
@@ -3333,6 +3436,7 @@ with st.spinner("回测计算中..."):
         range_thr=_range_thr,
         rsi_weight=_rsi_weight,
         spy_full=_spy_for_bt,
+        beta=_beta_val,
     )
 
 if bt["metrics"] is None:
