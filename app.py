@@ -273,6 +273,51 @@ def compute_bollinger(series: pd.Series, window: int = 20):
     return ma + 2 * std, ma, ma - 2 * std
 
 
+def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """Wilder's True Range: max(H-L, |H-prev_close|, |L-prev_close|)."""
+    prev_close = close.shift(1)
+    return pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+
+def compute_choppiness(high: pd.Series, low: pd.Series, close: pd.Series,
+                       period: int = 14) -> pd.Series:
+    """Choppiness Index (Bill Dreiss).
+       CI = 100 × log10( Σ(TR, period) / (max(H, period) - min(L, period)) ) / log10(period)
+       CI > 61.8 → strong choppy / range-bound market
+       CI < 38.2 → strong trending market"""
+    tr        = _true_range(high, low, close)
+    tr_sum    = tr.rolling(period).sum()
+    high_max  = high.rolling(period).max()
+    low_min   = low.rolling(period).min()
+    rng       = (high_max - low_min).replace(0, np.nan)
+    ratio     = (tr_sum / rng).replace(0, np.nan)
+    return 100.0 * np.log10(ratio) / np.log10(period)
+
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series,
+                period: int = 14) -> pd.Series:
+    """Wilder's ADX — Average Directional Index.
+       Steps: +DM/-DM → smoothed +DI/-DI → DX → ADX (Wilder-smoothed)."""
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm   = ((up_move > down_move) & (up_move > 0)).astype(float) * up_move.clip(lower=0)
+    minus_dm  = ((down_move > up_move) & (down_move > 0)).astype(float) * down_move.clip(lower=0)
+
+    tr = _true_range(high, low, close)
+    # Wilder smoothing = EMA with alpha = 1/period
+    atr_w    = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    plus_di  = 100.0 * plus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di = 100.0 * minus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr_w.replace(0, np.nan)
+
+    dx  = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+    return adx
+
+
 def compute_regime(df: pd.DataFrame) -> dict:
     """
     Classify market state per bar using MA50 10-day normalised slope.
@@ -374,6 +419,24 @@ def _beta_tier_label(beta: float | None) -> tuple[str, str]:
     if beta > 1.2:          return ("高Beta (>1.2)",   "high")
     if beta >= 0.9:         return ("中性 (0.9-1.2)",  "neutral")
     return ("防御 (<0.9)",  "defensive")
+
+
+def _regime_position_modifier(beta: float | None, spy_bear: bool) -> float:
+    """Position-size multiplier driven by (beta tier, SPY regime).
+    Replaces the old spy_penalty-on-score approach with size-based risk management.
+       beta > 1.2          → 100% always (independent alpha, ignore SPY)
+       0.9 ≤ beta ≤ 1.2    → 75% if SPY bear else 100%
+       beta < 0.9          → 50% if SPY bear else 100%
+       Unknown beta defaults to the neutral tier."""
+    if not spy_bear:
+        return 1.0
+    if beta is None:
+        return 0.75
+    if beta > 1.2:
+        return 1.0
+    if beta >= 0.9:
+        return 0.75
+    return 0.5
 
 
 def compute_score(
@@ -536,11 +599,13 @@ def run_backtest(
     """
     Simulate the signal strategy on historical data.
 
-    Score adjustment per bar (added to weighted_score before threshold check):
-      - SPY bear (MA20 < MA50), beta-tiered penalty:
-          beta > 1.2   →  0.0   (high-beta: skip SPY filter)
-          0.9-1.2      → -0.5
-          beta < 0.9   → -1.0
+    SPY regime no longer affects the entry score — it modifies position size:
+      - SPY bear + beta > 1.2     → 100% (independent alpha, ignore SPY)
+      - SPY bear + 0.9 ≤ β ≤ 1.2 →  75%
+      - SPY bear + beta < 0.9    →  50%
+      - SPY bull (any beta)       → 100%
+    This multiplier stacks on top of the ATR-based position sizer (0.5/1.0/1.5).
+
     Hard blocks:
       - DOWNTREND regime, volatility spike, 2-bar cooldown after DOWNTREND
       - Volume confirmation: current bar volume must exceed 20-day average
@@ -563,15 +628,12 @@ def run_backtest(
     # Per-bar volume confirmation: today's volume must exceed 20-day average
     _vol_avg20 = pd.Series(volumes).rolling(20, min_periods=5).mean().values
 
-    # Per-bar SPY bear flag (sector RS removed — see attribution analysis: it hurt Sharpe)
+    # Per-bar SPY bear flag (drives the regime-based position size modifier)
     if spy_full is not None and not spy_full.empty and {"MA20", "MA50"}.issubset(spy_full.columns):
         _spy_aligned = spy_full.reindex(df.index, method="ffill")
         _spy_bear_series = (_spy_aligned["MA20"] < _spy_aligned["MA50"]).fillna(False).values
     else:
         _spy_bear_series = np.zeros(n, dtype=bool)
-
-    # Beta-tiered SPY penalty (precomputed once)
-    _spy_penalty = _spy_penalty_for_beta(beta)
 
     # ATR-based position sizing: 14-day ATR vs 20-day rolling mean ATR
     _prev_c = np.roll(closes, 1); _prev_c[0] = closes[0]
@@ -622,10 +684,9 @@ def run_backtest(
             # Volatility spike: ATR > 2× 20-day mean ATR blocks entry
             if regime_info["vol_filter"].iloc[i]:
                 continue
-            # Beta-tiered SPY bear penalty (sector/SPY RS removed — see attribution)
-            _adj = _spy_penalty if _spy_bear_series[i] else 0.0
+            # Score check uses ONLY technical signals — no SPY penalty
             entry_threshold = uptrend_thr if cur_reg == "UPTREND" else range_thr
-            if (scores.iloc[i] + _adj) >= entry_threshold:
+            if scores.iloc[i] >= entry_threshold:
                 # Volume confirmation: today's volume must exceed 20-day avg
                 _va = _vol_avg20[i]
                 if not np.isnan(_va) and _va > 0 and volumes[i] <= _va:
@@ -633,7 +694,10 @@ def run_backtest(
                 entry_idx = i + 1
                 # Execute at next-day open (more realistic than close-to-close)
                 entry_price    = float(opens[entry_idx]) * (1 + slippage + commission)
-                entry_position = _position_size(i)   # ATR ratio at signal bar
+                # Position size = ATR-based sizer × regime-based modifier
+                _atr_mult    = _position_size(i)
+                _regime_mult = _regime_position_modifier(beta, bool(_spy_bear_series[i]))
+                entry_position = _atr_mult * _regime_mult
                 in_trade = True
         else:
             pnl = (float(closes[i]) - entry_price) / entry_price
@@ -912,20 +976,19 @@ def get_signal(
 ) -> tuple[str, list[str], dict]:
     """Regime-filtered rule-based signal generator.
 
-    Score adjustments (all stack on weighted_score):
+    Score adjustments (stack on weighted_score):
       • Insider trades:        ±0.5 (CEO/CFO 大额)
       • News sentiment:        ±0.3 (>+30 / <-30)
-      • SPY bear, beta-tiered:
-          beta > 1.2   →  0.0  (high-beta: independent alpha, no penalty)
-          0.9-1.2      → -0.5
-          beta < 0.9   → -1.0
+    Position-size modifier (computed, not added to score):
+      • SPY bear + beta > 1.2     → 100% (independent alpha, full size)
+      • SPY bear + 0.9 ≤ β ≤ 1.2 →  75%
+      • SPY bear + beta < 0.9    →  50%
+      • SPY bull (any beta)       → 100%
+      → exposed via regime_info["position_modifier"] for the UI to display.
     Hard blocks (no score):
-      • DOWNTREND regime:      buy_threshold=None (BUY impossible)
-      • Volatility spike:      buy_threshold=None
-      • Volume confirmation:   today's volume must exceed 20-day average
-      • Earnings proximity:    BUY blocked within 3 days of earnings
+      • DOWNTREND regime, volatility spike, volume confirmation, earnings ≤ 3 days
     Display-only (no score effect):
-      • RS_SPY spread (rs_spy): shown in reasons for context
+      • RS_SPY spread (rs_spy)
     """
     regime_info = compute_regime(df)
     regime      = regime_info["current"]
@@ -973,16 +1036,20 @@ def get_signal(
 
     # ── SPY bear regime, beta-tiered penalty ────────────────────────────────────
     _beta_label, _beta_tier = _beta_tier_label(beta)
-    _spy_pen = _spy_penalty_for_beta(beta) if spy_bear else 0.0
-    if spy_bear and _spy_pen < 0:
-        reasons.append(
-            f"大盘趋势向下（SPY MA20<MA50）+ {_beta_label} → 压制信号 ({_spy_pen:+.1f}分)"
-        )
-    elif spy_bear and _spy_pen == 0:
-        reasons.append(
-            f"大盘趋势向下，但 {_beta_label} 跳过 SPY 过滤（独立 alpha）"
-        )
-    weighted_score = weighted_score + _spy_pen
+
+    # ── SPY regime → position-size modifier (no score effect) ──────────────────
+    _pos_mod = _regime_position_modifier(beta, spy_bear)
+    if spy_bear:
+        if _pos_mod < 1.0:
+            reasons.append(
+                f"大盘趋势向下 + {_beta_label} → 建议仓位 {_pos_mod:.0%}（降低敞口）"
+            )
+        else:
+            reasons.append(
+                f"大盘趋势向下，但 {_beta_label} 保持满仓 {_pos_mod:.0%}（独立 alpha）"
+            )
+    else:
+        reasons.append(f"大盘趋势向上，{_beta_label} 建议仓位 {_pos_mod:.0%}")
 
     # ── RS_SPY: display only, no score effect ──────────────────────────────────
     if rs_spy is not None:
@@ -999,14 +1066,14 @@ def get_signal(
         reasons.append(f"波动率过高（ATR {_atr_ratio:.1f}×均值），暂停买入")
         buy_threshold = None
 
-    regime_info["raw_score"]      = raw_score
-    regime_info["weighted_score"] = weighted_score
-    regime_info["buy_threshold"]  = buy_threshold
-    regime_info["rs_spy"]         = rs_spy
-    regime_info["beta"]           = beta
-    regime_info["beta_tier"]      = _beta_tier
-    regime_info["beta_label"]     = _beta_label
-    regime_info["spy_penalty"]    = _spy_pen
+    regime_info["raw_score"]        = raw_score
+    regime_info["weighted_score"]   = weighted_score
+    regime_info["buy_threshold"]    = buy_threshold
+    regime_info["rs_spy"]           = rs_spy
+    regime_info["beta"]             = beta
+    regime_info["beta_tier"]        = _beta_tier
+    regime_info["beta_label"]       = _beta_label
+    regime_info["position_modifier"] = _pos_mod
 
     if buy_threshold is not None and weighted_score >= buy_threshold:
         # ── Volume confirmation (hard block) ──────────────────────────────────
@@ -2331,10 +2398,28 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.utils.class_weight import compute_sample_weight
+        from sklearn.isotonic import IsotonicRegression
         import xgboost as xgb
         import lightgbm as lgb
     except ImportError as e:
         return {"error": f"missing_lib:{e}"}
+
+    def _ece(probs, actual_bin, n_bins=5) -> float:
+        """Expected Calibration Error: weighted mean |predicted − actual| over 5 bins."""
+        probs  = np.asarray(probs, dtype=float)
+        actual = np.asarray(actual_bin, dtype=float)
+        m = len(probs)
+        if m == 0:
+            return 0.0
+        edges = np.linspace(0.0, 1.0, n_bins + 1)
+        e = 0.0
+        for b in range(n_bins):
+            lo, hi = edges[b], edges[b + 1]
+            mask = (probs >= lo) & (probs <= hi) if b == n_bins - 1 else (probs >= lo) & (probs < hi)
+            if mask.sum() == 0:
+                continue
+            e += (mask.sum() / m) * abs(probs[mask].mean() - actual[mask].mean())
+        return float(e)
 
     HORIZON  = 5
     MIN_ROWS = 100
@@ -2378,12 +2463,13 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         _age     = np.array([(_dates_v[-1] - d).days for d in _dates_v], dtype=float)
         weights  = np.exp(-_DECAY * _age)   # shape (valid_n,), newest=1.0
 
-        # Feature names
+        # Feature names (19 dims: 17 base + CI + ADX)
         _feat_names = [
             "RSI", "RSI变化", "MACD", "MACD柱", "MACD柱变化",
             "布林%B", "ATR", "MA20偏差", "MA50偏差",
             "1日动量", "3日动量", "5日动量", "10日动量", "20日动量",
             "成交量变化1日", "成交量变化5日", "VWAP偏差",
+            "震荡指数CI", "趋势强度ADX",
         ]
         _n_feats = X_v.shape[1]
         _cols = _feat_names[:_n_feats]
@@ -2476,6 +2562,13 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         fold_accs = {m: [] for m in
                      ["LogReg", "RandomForest", "XGBoost", "LightGBM", "Ensemble"]}
 
+        # Calibration: collect each fold's raw OOS ensemble TP probs + actuals.
+        _fold_raw_list, _fold_act_list = [], []
+
+        def _tp_index(clf):
+            cls = list(clf.classes_)
+            return cls.index(2) if 2 in cls else None
+
         last_fold_params = None
         for fold_tr, fold_te in outer_splits:
             if len(fold_tr) < 30 or len(fold_te) < 30:
@@ -2499,11 +2592,15 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
                 "LightGBM":     lgb.LGBMClassifier(**f_lgb, random_state=42, verbose=-1, n_jobs=1),
             }
             preds = {}
+            _tp_te_list = []   # per-model TP prob on this fold's OOS test set
             for name, clf in clfs.items():
                 Xtr_ = Xtr_df if name == "LightGBM" else Xtr
                 Xte_ = Xte_df if name == "LightGBM" else Xte
                 clf.fit(Xtr_, lbl_tr, sample_weight=w_fold)
                 preds[name] = clf.predict(Xte_)
+                _ti = _tp_index(clf)
+                if _ti is not None:
+                    _tp_te_list.append(clf.predict_proba(Xte_)[:, _ti])
             # Majority-vote ensemble
             _ens_arr = np.array(list(preds.values()))
             preds["Ensemble"] = np.array([
@@ -2513,11 +2610,41 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             for name, p in preds.items():
                 fold_accs[name].append(float(np.mean(p == lbl_te)))
 
+            # Raw ensemble TP prob for this fold's OOS test set — these are
+            # genuine out-of-sample predictions (model never saw fold_te).
+            if _tp_te_list:
+                _fold_raw_list.append(np.mean(np.column_stack(_tp_te_list), axis=1))
+                _fold_act_list.append((lbl_te == 2).astype(float))
+
             last_fold_params = {"C": f_C, "rf": f_rf, "xgb": f_xgb, "lgb": f_lgb,
                                  "tr": fold_tr, "te": fold_te}
 
         model_avg_acc = {k: float(np.mean(v)) if v else 0.0
                          for k, v in fold_accs.items()}
+
+        # ── Isotonic calibration — fit ONLY on out-of-sample predictions ──────
+        # Fitting on in-sample (training) predictions is invalid: models overfit
+        # the training set, so the isotonic map memorises noise and fails OOS.
+        # Instead: leave-one-fold-out — calibrate each fold using the OTHER folds'
+        # OOS predictions; the final live mapping uses all OOS pairs.
+        ece_raw, ece_cal, _calib_n = 0.0, 0.0, 0
+        _final_iso = None
+        if len(_fold_raw_list) >= 2:
+            _all_raw = np.concatenate(_fold_raw_list)
+            _all_act = np.concatenate(_fold_act_list)
+            _calib_n = len(_all_act)
+            ece_raw = _ece(_all_raw, _all_act)
+            _cal_loo = []
+            for _k in range(len(_fold_raw_list)):
+                _oth_raw = np.concatenate([_fold_raw_list[j] for j in range(len(_fold_raw_list)) if j != _k])
+                _oth_act = np.concatenate([_fold_act_list[j] for j in range(len(_fold_act_list)) if j != _k])
+                _iso_k = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+                _iso_k.fit(_oth_raw, _oth_act)
+                _cal_loo.append(np.asarray(_iso_k.predict(_fold_raw_list[_k]), dtype=float))
+            ece_cal = _ece(np.concatenate(_cal_loo), _all_act)
+            # Final mapping for the live current-bar prediction: all OOS pairs
+            _final_iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            _final_iso.fit(_all_raw, _all_act)
 
         # ── Global tuning + final retrain on all data ─────────────────────────
         w_all = weights * compute_sample_weight("balanced", labels)
@@ -2557,6 +2684,13 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
         ens_tp      = (lr_tp  + rf_tp  + xgb_tp  + lgb_tp)  / 4
         ens_sl      = (lr_sl  + rf_sl  + xgb_sl  + lgb_sl)  / 4
         ens_neutral = (lr_neutral + rf_neutral + xgb_neutral + lgb_neutral) / 4
+
+        # ── Calibrate the current-bar Ensemble TP probability ──────────────────
+        # _final_iso was fit on the Walk-Forward OOS predictions (clean, no
+        # in-sample leakage). Map the live raw probability through it.
+        ens_tp_calibrated = ens_tp
+        if _final_iso is not None:
+            ens_tp_calibrated = float(_final_iso.predict([ens_tp])[0])
 
         model_probs = {
             "LogReg":       {"tp": lr_tp,  "sl": lr_sl,  "neutral": lr_neutral},
@@ -2630,6 +2764,11 @@ def run_ml_prediction(feat_rows: tuple, close_tuple: tuple, dates_tuple: tuple,
             "ens_tp":          ens_tp,
             "ens_sl":          ens_sl,
             "ens_neutral":     ens_neutral,
+            "ens_tp_raw":        ens_tp,             # raw ensemble P(止盈)
+            "ens_tp_calibrated": ens_tp_calibrated,  # after IsotonicRegression
+            "ece_raw":           ece_raw,            # OOS ECE before calibration
+            "ece_calibrated":    ece_cal,            # OOS ECE after calibration
+            "calib_n":           _calib_n,           # OOS sample count behind ECE
             "model_probs":     model_probs,
             "model_avg_acc":   model_avg_acc,
             "model_fold_accs": {k: v for k, v in fold_accs.items()},
@@ -3161,12 +3300,19 @@ for _i in range(19, _n_ml):
     _vwap20[_i] = _cv[_i - 19: _i + 1].sum() / _sv if _sv > 0 else _close_arr[_i]
 _vwap_dev = np.where(_close_arr > 0, (_close_arr - _vwap20) / _close_arr, np.nan)
 
-# Stack all 17 features
+# Regime indicators — give the model awareness of trending vs choppy markets
+_ci_series  = compute_choppiness(df["High"], df["Low"], df["Close"], period=14)
+_adx_series = compute_adx(df["High"], df["Low"], df["Close"], period=14)
+_ci_arr  = _ci_series.values.astype(float)
+_adx_arr = _adx_series.values.astype(float)
+
+# Stack all 19 features (17 base + CI + ADX)
 _ml_feat = np.column_stack([
     _rsi_n, _rsi_chg, _macd_n, _macd_h_n, _macd_h_chg,
     _bb_pctb, _atr_n, _ma20_dev, _ma50_dev,
     _ret1, _ret3, _ret5, _ret10, _ret20,
     _vol_chg1, _vol_chg5, _vwap_dev,
+    _ci_arr, _adx_arr,
 ])
 
 # Rolling Z-score normalization (window=20, min 5 obs) — removes non-stationarity
@@ -3318,8 +3464,34 @@ _rs_spy_txt, _rs_spy_col = _rs_disp(_rs_spy_now)
 # Beta tier display
 _beta_tier_lbl_zh, _beta_tier_key = _beta_tier_label(_beta_val)
 _tier_col = {"high": C["up"], "neutral": C["accent2"], "defensive": C["warn"], "unknown": C["muted"]}[_beta_tier_key]
-_spy_pen_now = _spy_penalty_for_beta(_beta_val)
-_pen_txt = f"过滤权重 {_spy_pen_now:+.1f}分" if _spy_pen_now != 0 else "跳过 SPY 过滤"
+
+# Risk-adjusted position size (regime modifier — already computed in get_signal)
+_pos_mod_now = regime_info.get("position_modifier", 1.0)
+_pos_pct = int(round(_pos_mod_now * 100))
+_pos_col = C["up"] if _pos_mod_now >= 1.0 else C["warn"] if _pos_mod_now >= 0.75 else C["down"]
+
+# Current CI and ADX values for display (computed from df, last bar)
+def _last_finite(series):
+    s = series.dropna()
+    return float(s.iloc[-1]) if not s.empty else None
+
+_ci_now  = _last_finite(compute_choppiness(df["High"], df["Low"], df["Close"], period=14))
+_adx_now = _last_finite(compute_adx(df["High"], df["Low"], df["Close"], period=14))
+
+def _ci_tag(v):
+    if v is None:        return ("—", C["muted"])
+    if v > 61.8:         return (f"{v:.1f} · 强震荡",  C["warn"])
+    if v < 38.2:         return (f"{v:.1f} · 强趋势",  C["up"])
+    return (f"{v:.1f} · 中性", C["muted"])
+
+def _adx_tag(v):
+    if v is None:        return ("—", C["muted"])
+    if v >= 25:          return (f"{v:.1f} · 趋势成立",  C["up"])
+    if v < 20:           return (f"{v:.1f} · 趋势弱",    C["warn"])
+    return (f"{v:.1f} · 边缘", C["muted"])
+
+_ci_txt,  _ci_col  = _ci_tag(_ci_now)
+_adx_txt, _adx_col = _adx_tag(_adx_now)
 
 _cross_asset_html = (
     f"<div style='margin-top:8px; padding:7px 9px; background:{C['surface']};"
@@ -3327,8 +3499,14 @@ _cross_asset_html = (
     f"<div><span style='color:{C['dim']};'>Market (SPY)</span> &nbsp;"
     f"<span style='color:{_spy_col_v}; font-weight:600;'>{_spy_zh}</span></div>"
     f"<div><span style='color:{C['dim']};'>当前 Beta 分段</span> &nbsp;"
-    f"<span style='color:{_tier_col}; font-weight:600;'>{_beta_tier_lbl_zh}</span>"
-    f" &nbsp;<span style='color:{C['dim']}; font-size:9px;'>· {_pen_txt}</span></div>"
+    f"<span style='color:{_tier_col}; font-weight:600;'>{_beta_tier_lbl_zh}</span></div>"
+    f"<div><span style='color:{C['dim']};'>风险调整后仓位</span> &nbsp;"
+    f"<span style='font-family:Space Mono,monospace; color:{_pos_col}; font-weight:700;'>{_pos_pct}%</span>"
+    f" &nbsp;<span style='color:{C['dim']}; font-size:9px;'>· regime × ATR</span></div>"
+    f"<div><span style='color:{C['dim']};'>震荡指数 CI</span> &nbsp;"
+    f"<span style='font-family:Space Mono,monospace; color:{_ci_col}; font-weight:600;'>{_ci_txt}</span></div>"
+    f"<div><span style='color:{C['dim']};'>趋势强度 ADX</span> &nbsp;"
+    f"<span style='font-family:Space Mono,monospace; color:{_adx_col}; font-weight:600;'>{_adx_txt}</span></div>"
     f"<div><span style='color:{C['dim']};'>RS vs SPY</span> &nbsp;"
     f"<span style='font-family:Space Mono,monospace; color:{_rs_spy_col}; font-weight:600;'>{_rs_spy_txt}</span>"
     f" &nbsp;<span style='color:{C['dim']}; font-size:9px;'>· 仅参考</span></div>"
@@ -3839,6 +4017,11 @@ with ml_tab:
         _probs      = ml["model_probs"]
         _ens_tp     = ml["ens_tp"]
         _ens_sl     = ml["ens_sl"]
+        _ens_tp_raw = ml.get("ens_tp_raw", _ens_tp)
+        _ens_tp_cal = ml.get("ens_tp_calibrated", _ens_tp)
+        _ece_raw    = ml.get("ece_raw", 0.0)
+        _ece_cal    = ml.get("ece_calibrated", 0.0)
+        _calib_n    = ml.get("calib_n", 0)
         _ens_acc    = _avg.get("Ensemble", 0.0)
         _lbl_cnt    = ml.get("label_counts", {})
         _cur_atr    = ml.get("cur_atr_pct")        # ATR/Close ratio, may be None
@@ -3869,10 +4052,10 @@ with ml_tab:
         # ── Summary metric cards ──────────────────────────────────────────
         ml1, ml2, ml3, ml4 = st.columns(4)
         _ml_cards = [
-            (ml1, "止盈概率（集成）",
-             f"{_ens_tp:.1%}",
-             f"上壁障 +{_cur_tp_bar:.1%}（2×ATR）",
-             _prob_color(_ens_tp)),
+            (ml1, "止盈概率（校准后）",
+             f"{_ens_tp_cal:.1%}",
+             f"原始 {_ens_tp_raw:.1%} → Isotonic 校准",
+             _prob_color(_ens_tp_cal)),
             (ml2, "止损概率（集成）",
              f"{_ens_sl:.1%}",
              f"下壁障 -{_cur_sl_bar:.1%}（1.5×ATR）",
@@ -3891,6 +4074,33 @@ with ml_tab:
               <div class='mc-value' style='color:{color};'>{val}</div>
               <div class='mc-sub'>{sub}</div>
             </div>""", unsafe_allow_html=True)
+
+        # ── Calibration banner: raw vs calibrated probability + ECE ────────
+        _delta_pp   = (_ens_tp_cal - _ens_tp_raw) * 100
+        _ece_better = _ece_cal < _ece_raw
+        _ece_col    = C["up"] if _ece_cal < 0.05 else C["warn"] if _ece_cal < 0.10 else C["down"]
+        _ece_verdict = (
+            "校准极好，Kelly Sizing 安全" if _ece_cal < 0.05 else
+            "校准良好，可用半 Kelly"      if _ece_cal < 0.10 else
+            "校准一般，建议 1/4 Kelly"    if _ece_cal < 0.20 else
+            "校准差，禁用 Kelly"
+        )
+        st.markdown(
+            f"<div style='font-size:12px;color:{C['muted']};padding:8px 12px;margin-top:10px;"
+            f"background:{C['surface']};border:1px solid {C['border']};border-radius:6px;'>"
+            f"<b style='color:{C['text']};'>Isotonic 概率校准</b> &nbsp;·&nbsp; "
+            f"当前止盈概率 原始 <b style='color:{C['dim']};'>{_ens_tp_raw:.1%}</b> → "
+            f"校准后 <b style='color:{_prob_color(_ens_tp_cal)};'>{_ens_tp_cal:.1%}</b> "
+            f"（{_delta_pp:+.1f}pp）<br>"
+            f"<span style='font-size:11px;'>OOS 校准误差 ECE：</span> "
+            f"校准前 <b style='color:{C['down']};'>{_ece_raw:.3f}</b> → "
+            f"校准后 <b style='color:{_ece_col};'>{_ece_cal:.3f}</b> "
+            f"{'✅ 改善' if _ece_better else '⚠️ 未改善'} &nbsp;·&nbsp; "
+            f"<span style='color:{_ece_col};'>{_ece_verdict}</span> "
+            f"<span style='font-size:10px;color:{C['dim']};'>（基于 {_calib_n} 个 Walk-Forward OOS 样本）</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -3945,7 +4155,7 @@ with ml_tab:
         with imp_col:
             st.markdown(
                 f"<div style='font-size:12px;color:{C['muted']};margin-bottom:4px;'>"
-                "随机森林特征重要性（17维）</div>",
+                "随机森林特征重要性（19维）</div>",
                 unsafe_allow_html=True,
             )
             st.plotly_chart(build_ml_importance_chart(ml, C), width="stretch")
@@ -3962,7 +4172,7 @@ with ml_tab:
         st.markdown(
             f"<div style='font-size:11px;color:{_ml_dim};margin-top:4px;'>"
             f"标签：三壁障法（上壁障 2×ATR14 / 下壁障 1.5×ATR14 / 横壁障 {ml['horizon']} 日）&nbsp;·&nbsp; "
-            f"特征（17维·滚动Z分·已调权价格）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 &nbsp;·&nbsp; "
+            f"特征（19维·滚动Z分·已调权价格）：RSI · MACD · 布林%B · ATR · MA偏差 · 多周期动量 · 成交量变化 · VWAP偏差 · 震荡指数CI · 趋势强度ADX &nbsp;·&nbsp; "
             f"模型：LogReg + RandomForest + XGBoost + LightGBM &nbsp;·&nbsp; "
             f"验证：Walk-Forward {ml['n_splits']} 折（Embargo {ml['embargo']}日）&nbsp;·&nbsp; "
             f"超参数：自动调优（内层 3 折）</div>",
